@@ -25,14 +25,12 @@ class ZmqPubClient(BaseZmqClient):
         *,
         bind: bool = True,
         linger_ms: int = 0,
-        topic: str = "",
     ):
         super().__init__(endpoint, bind=bind, linger_ms=linger_ms)
-        self.topic = topic
 
-    def send(self, header: ProtocolHeaderDTO, *, topic: str | None = None) -> None:
-        """ProtocolHeaderDTO를 JSON multipart로 송신한다."""
-        t = (topic if topic is not None else self.topic).encode("utf-8")
+    def send(self, header: ProtocolHeaderDTO, *, topic: str) -> None:
+        """ProtocolHeaderDTO를 JSON multipart로 송신한다. topic은 필수."""
+        t = topic.encode("utf-8")
         payload = header.model_dump_json().encode("utf-8")
         try:
             self.sock.send_multipart([t, payload], flags=zmq.NOBLOCK)
@@ -45,8 +43,4 @@ class ZmqPubClient(BaseZmqClient):
             raise to_client_error(
                 e, default=ClientErrorCode.WRITE_FAILED
             ) from e
-        logger.debug(
-            "zmq pub [%s] %s",
-            (topic if topic is not None else self.topic) or "-",
-            header.msg_type.value,
-        )
+        logger.debug("zmq pub [%s] %s", topic, header.msg_type.value)

@@ -2,7 +2,7 @@
 PLC 주기 스캔 데몬.
 
 devices[] 각각에 대해 워커 스레드를 띄워
-연결 → 주소 읽기 → MsgDataDTO 조립 → emit_data() 순으로 돈다.
+연결 → 주소 읽기 → MsgDataDTO 조립 → emit_data()(ZeroMQ PUB) 순으로 돈다.
 연결 실패/끊김은 프로세스를 종료하지 않고 재연결한다.
 """
 
@@ -33,18 +33,22 @@ from model.protocol_model import (
     MsgWriteItemDTO,
     ProtocolHeaderDTO,
 )
+from zeromq_client.zmq_client import ZeroMqClient
 
 logger = logging.getLogger(__name__)
 
 _running = True
+_zmq: ZeroMqClient | None = None
 
 
 def _on_signal(signum, frame):
+    """종료 시그널을 받아 메인 루프 플래그를 내린다."""
     global _running
     _running = False
 
 
 def build_client(device: DeviceSettings) -> BaseClient:
+    """mode에 맞는 PLC 클라이언트를 생성한다."""
     if device.mode == "tcp":
         return TcpClient(device)
     if device.mode == "rtu":
@@ -55,15 +59,17 @@ def build_client(device: DeviceSettings) -> BaseClient:
 
 
 def now_ms() -> int:
+    """현재 시각을 epoch 밀리초로 반환한다."""
     return int(time.time() * 1000)
 
 
 def _as_client_error(exc: BaseException) -> ClientError:
+    """예외를 ClientError로 정규화한다."""
     return exc if isinstance(exc, ClientError) else to_client_error(exc)
 
 
 def _sleep_interruptible(seconds: float) -> None:
-    """SIGINT/SIGTERM 시 빨리 빠져나오도록 짧게 쪼개 잔다."""
+    """종료 시그널에 끊길 수 있게 짧게 나눠 잔다."""
     deadline = time.monotonic() + max(0.0, seconds)
     while _running:
         remain = deadline - time.monotonic()
@@ -73,6 +79,7 @@ def _sleep_interruptible(seconds: float) -> None:
 
 
 def _safe_close(client: BaseClient) -> None:
+    """PLC 연결을 best-effort로 닫는다."""
     try:
         client.close()
     except Exception as e:
@@ -80,7 +87,7 @@ def _safe_close(client: BaseClient) -> None:
 
 
 def read_addr(client: BaseClient, addr: str) -> int:
-    """단건 읽기. D는 전 클라이언트 공통, M/X/Y는 McClient에서만."""
+    """주소 문자열 한 건을 읽어 정수로 반환한다."""
     kind = addr[0].upper()
     num = int(addr[1:])
 
@@ -97,7 +104,7 @@ def read_addr(client: BaseClient, addr: str) -> int:
 
 
 def write_addr(client: BaseClient, addr: str, value: int) -> None:
-    """단건 쓰기. D는 전 클라이언트 공통, M/X/Y는 McClient에서만."""
+    """주소 문자열 한 건에 값을 쓴다."""
     kind = addr[0].upper()
     num = int(addr[1:])
 
@@ -116,7 +123,7 @@ def write_addr(client: BaseClient, addr: str, value: int) -> None:
 
 
 def _addr_soft_error_code(err: ClientError, *, write: bool) -> str:
-    """번지 단위 soft error. 연결성 실패는 여기 오기 전에 raise 된다."""
+    """번지 soft-fail용 에러 코드 문자열을 고른다."""
     if err.code is ClientErrorCode.UNSUPPORTED_ADDR:
         return err.code.value
     return (
@@ -127,7 +134,7 @@ def _addr_soft_error_code(err: ClientError, *, write: bool) -> str:
 
 
 def read_sample(client: BaseClient, addr: str) -> MsgSampleDTO:
-    """단건 샘플. 연결성 실패는 전파, 그 외는 sample.error로 담는다."""
+    """단건 샘플을 읽고, 비연결 오류는 sample.error에 담는다."""
     try:
         return MsgSampleDTO(addr=addr, value=read_addr(client, addr), error=None)
     except Exception as e:
@@ -149,11 +156,12 @@ def read_sample(client: BaseClient, addr: str) -> MsgSampleDTO:
 
 
 def read_samples(client: BaseClient, addresses: list[str]) -> list[MsgSampleDTO]:
+    """주소 목록을 순회하며 샘플 리스트를 만든다."""
     return [read_sample(client, addr) for addr in addresses]
 
 
 def write_item(client: BaseClient, item: MsgWriteItemDTO) -> MsgWriteItemDTO:
-    """단건 쓰기. 연결성 실패는 전파, 그 외는 item.error로 담는다."""
+    """단건 쓰고, 비연결 오류는 item.error에 담는다."""
     try:
         write_addr(client, item.addr, item.value)
         return MsgWriteItemDTO(addr=item.addr, value=item.value, error=None)
@@ -178,6 +186,7 @@ def write_item(client: BaseClient, item: MsgWriteItemDTO) -> MsgWriteItemDTO:
 def write_items(
     client: BaseClient, items: list[MsgWriteItemDTO]
 ) -> list[MsgWriteItemDTO]:
+    """쓰기 항목 목록을 순회 처리한다."""
     return [write_item(client, item) for item in items]
 
 
@@ -188,7 +197,7 @@ def build_write_ack(
     action: MsgCmdWEnum,
     results: list[MsgWriteItemDTO],
 ) -> MsgAckDTO:
-    """번지별 결과로 ACK 조립. 전부 성공이면 ok, 일부/전부 soft-fail이면 error."""
+    """쓰기 결과로 ACK 메시지를 조립한다."""
     failed = [r for r in results if r.error]
     if not failed:
         status = MsgAckStatusEnum.OK
@@ -208,7 +217,7 @@ def build_write_ack(
 
 
 def emit_data(cfg: Settings, body: MsgDataDTO) -> None:
-    """나중에 ZeroMQ PUB으로 교체. 지금은 로그만."""
+    """스캔 데이터 메시지를 발행한다."""
     _emit_protocol(
         cfg,
         msg_type=MsgTypeEnum.DATA,
@@ -217,7 +226,7 @@ def emit_data(cfg: Settings, body: MsgDataDTO) -> None:
 
 
 def emit_health(cfg: Settings, body: MsgHealthDTO) -> None:
-    """나중에 ZeroMQ PUB으로 교체. 지금은 로그만."""
+    """헬스 메시지를 발행한다."""
     _emit_protocol(
         cfg,
         msg_type=MsgTypeEnum.HEALTH,
@@ -226,7 +235,7 @@ def emit_health(cfg: Settings, body: MsgHealthDTO) -> None:
 
 
 def emit_ack(cfg: Settings, body: MsgAckDTO) -> None:
-    """나중에 ZeroMQ PUB으로 교체. 지금은 로그만."""
+    """ACK 메시지를 발행한다."""
     _emit_protocol(
         cfg,
         msg_type=MsgTypeEnum.ACK,
@@ -235,6 +244,7 @@ def emit_ack(cfg: Settings, body: MsgAckDTO) -> None:
 
 
 def _emit_protocol(cfg: Settings, *, msg_type: MsgTypeEnum, body: dict) -> None:
+    """헤더를 씌워 로그하고 ZeroMQ PUB으로 보낸다."""
     header = ProtocolHeaderDTO(
         msg_id=uuid4(),
         gateway_address=cfg.app.gateway_address,
@@ -243,8 +253,20 @@ def _emit_protocol(cfg: Settings, *, msg_type: MsgTypeEnum, body: dict) -> None:
         msg_body=body,
         timestamp_ms=now_ms(),
     )
-    # TODO: zmq_sock.send_json(header.model_dump(mode="json"))
     logger.info("[%s] %s", msg_type.value.upper(), header.model_dump_json())
+    zmq = _zmq
+    if zmq is None:
+        return
+    try:
+        zmq.send(header)
+    except Exception as e:
+        err = _as_client_error(e)
+        logger.warning(
+            "zmq pub failed: %s(%s) %s",
+            err.code.value,
+            err.code.label,
+            err.detail or err,
+        )
 
 
 def _emit_device_health(
@@ -254,6 +276,7 @@ def _emit_device_health(
     device_ok: bool,
     reason: str | None = None,
 ) -> None:
+    """디바이스 연결 상태를 health로 발행한다."""
     emit_health(
         cfg,
         MsgHealthDTO(
@@ -270,6 +293,7 @@ def scan_once(
     device: DeviceSettings,
     client: BaseClient,
 ) -> MsgDataDTO:
+    """스캔 주소들을 한 번 읽어 MsgDataDTO를 만든다."""
     samples = read_samples(client, device.scan_addresses)
     return MsgDataDTO(
         device_id=device.id,
@@ -285,7 +309,7 @@ def ensure_connected(
     client: BaseClient,
     reconnect_s: float,
 ) -> bool:
-    """연결될 때까지 재시도. 성공 True, 종료 신호면 False."""
+    """연결될 때까지 재시도하고, 종료 신호면 False를 반환한다."""
     while _running:
         try:
             client.connect()
@@ -309,7 +333,7 @@ def ensure_connected(
 
 
 def run_device(cfg: Settings, device: DeviceSettings) -> None:
-    """단일 디바이스 스캔 루프 (스레드에서 실행)."""
+    """단일 디바이스의 연결·스캔·재연결 루프를 돌린다."""
     period_s = device.scan_period_ms / 1000.0
     reconnect_s = cfg.app.reconnect_period_ms / 1000.0
     client = build_client(device)
@@ -373,7 +397,8 @@ def run_device(cfg: Settings, device: DeviceSettings) -> None:
 
 
 def run(cfg: Settings | None = None) -> None:
-    global _running
+    """ZeroMQ를 열고 디바이스 워커를 띄운 뒤 종료까지 대기한다."""
+    global _running, _zmq
     cfg = cfg or settings
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
@@ -383,6 +408,20 @@ def run(cfg: Settings | None = None) -> None:
         [d.id for d in cfg.devices],
         cfg.app.reconnect_period_ms,
     )
+
+    zmq = ZeroMqClient(cfg.app.zmq, collector_address=cfg.app.collector_address)
+    try:
+        zmq.connect()
+    except Exception as e:
+        err = _as_client_error(e)
+        logger.error(
+            "ZeroMQ connect failed: %s(%s) %s",
+            err.code.value,
+            err.code.label,
+            err.detail or err,
+        )
+        raise
+    _zmq = zmq
 
     threads = [
         threading.Thread(
@@ -403,6 +442,11 @@ def run(cfg: Settings | None = None) -> None:
         _running = False
         for t in threads:
             t.join(timeout=cfg.app.reconnect_period_ms / 1000.0 + 2.0)
+        _zmq = None
+        try:
+            zmq.close()
+        except Exception as e:
+            logger.debug("zmq close failed: %s", e)
         logger.info("daemon stop")
 
 

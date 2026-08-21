@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ZmqSettings(BaseModel):
@@ -27,6 +27,17 @@ class AppSettings(BaseModel):
     collector_address: str = "collector-plc"
     reconnect_period_ms: int = 5000
     zmq: ZmqSettings = Field(default_factory=ZmqSettings)
+
+    @field_validator("collector_address")
+    @classmethod
+    def _no_dot_in_collector_address(cls, v: str) -> str:
+        # 토픽 collector.plc.{address}.{msg_type} 계층이 깨지지 않게
+        if not v or "." in v:
+            raise ValueError(
+                "collector_address에 '.'를 넣을 수 없습니다 "
+                f"(예: line-a, collector-plc): {v!r}"
+            )
+        return v
 
 
 class TcpSettings(BaseModel):
