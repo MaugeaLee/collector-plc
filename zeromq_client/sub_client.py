@@ -26,17 +26,18 @@ class ZmqSubClient(BaseZmqClient):
         *,
         bind: bool = False,
         linger_ms: int = 0,
-        topic: str = "",
+        topics: list[str] | None = None,
         recv_timeout_ms: int = 100,
     ):
         super().__init__(endpoint, bind=bind, linger_ms=linger_ms)
-        self.topic = topic
+        # topics=[] / None → 전부 구독("")
+        self.topics = topics if topics is not None else [""]
         self.recv_timeout_ms = recv_timeout_ms
 
     def _configure_socket(self, sock: zmq.Socket) -> None:
         sock.setsockopt(zmq.RCVTIMEO, self.recv_timeout_ms)
-        # topic="" 이면 전부 구독
-        sock.setsockopt_string(zmq.SUBSCRIBE, self.topic)
+        for topic in self.topics:
+            sock.setsockopt_string(zmq.SUBSCRIBE, topic)
 
     def recv(self, timeout_ms: int | None = None) -> ProtocolHeaderDTO | None:
         """한 건 수신. 타임아웃이면 None, 프로토콜 오류는 ClientError."""
@@ -69,5 +70,9 @@ class ZmqSubClient(BaseZmqClient):
                 f"ProtocolHeaderDTO 파싱 실패: {e}",
             ) from e
 
-        logger.debug("zmq sub [%s] %s", frames[0].decode("utf-8", errors="replace"), header.msg_type.value)
+        logger.debug(
+            "zmq sub [%s] %s",
+            frames[0].decode("utf-8", errors="replace"),
+            header.msg_type.value,
+        )
         return header

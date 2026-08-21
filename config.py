@@ -70,7 +70,6 @@ def _load_app_from_env() -> AppSettings:
     return AppSettings(
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
         gateway_address=_env_str("GATEWAY_ADDRESS", "gateway"),
-        collector_address=_env_str("COLLECTOR_ADDRESS", "collector-plc"),
         reconnect_period_ms=_env_int("RECONNECT_PERIOD_MS", 5000),
         zmq=ZmqSettings(
             pub_endpoint=_env_str("ZMQ_PUB_ENDPOINT", "tcp://127.0.0.1:5555"),

@@ -12,6 +12,21 @@
       "scan_period_ms": 1000
     },
     {
+      "id": "plc-rtu-1",
+      "mode": "rtu",
+      "device_id": 1,
+      "timeout": 3,
+      "retries": 3,
+      "port": "COM3",
+      "baudrate": 9600,
+      "bytesize": 8,
+      "parity": "N",
+      "stopbits": 1,
+      "handle_local_echo": false,
+      "scan_addresses": ["D100"],
+      "scan_period_ms": 1000
+    },
+    {
       "id": "plc-mc-1",
       "mode": "mc",
       "device_id": 1,

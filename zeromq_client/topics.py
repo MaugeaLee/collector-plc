@@ -1,4 +1,4 @@
-"""ZeroMQ 토픽 조립. collector.plc.{address}.{msg_type}."""
+"""ZeroMQ 토픽 조립. collector.plc.{devices[].id}.{msg_type}."""
 
 from __future__ import annotations
 

@@ -24,20 +24,18 @@ class AppSettings(BaseModel):
 
     log_level: str = "INFO"
     gateway_address: str = "gateway"
-    collector_address: str = "collector-plc"
     reconnect_period_ms: int = 5000
     zmq: ZmqSettings = Field(default_factory=ZmqSettings)
 
-    @field_validator("collector_address")
-    @classmethod
-    def _no_dot_in_collector_address(cls, v: str) -> str:
-        # 토픽 collector.plc.{address}.{msg_type} 계층이 깨지지 않게
-        if not v or "." in v:
-            raise ValueError(
-                "collector_address에 '.'를 넣을 수 없습니다 "
-                f"(예: line-a, collector-plc): {v!r}"
-            )
-        return v
+
+def _validate_device_logical_id(v: str) -> str:
+    # 토픽 collector.plc.{id}.{msg_type} 계층용
+    if not v or "." in v:
+        raise ValueError(
+            "devices[].id에 '.'를 넣을 수 없습니다 "
+            f"(예: plc-mitsubishi-1): {v!r}"
+        )
+    return v
 
 
 class TcpSettings(BaseModel):
@@ -86,17 +84,32 @@ class TcpDevice(TcpSettings):
     scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
     scan_period_ms: int = 1000
 
+    @field_validator("id")
+    @classmethod
+    def _id_no_dot(cls, v: str) -> str:
+        return _validate_device_logical_id(v)
+
 
 class RtuDevice(RtuSettings):
     id: str
     scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
     scan_period_ms: int = 1000
 
+    @field_validator("id")
+    @classmethod
+    def _id_no_dot(cls, v: str) -> str:
+        return _validate_device_logical_id(v)
+
 
 class McDevice(McSettings):
     id: str
     scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
     scan_period_ms: int = 1000
+
+    @field_validator("id")
+    @classmethod
+    def _id_no_dot(cls, v: str) -> str:
+        return _validate_device_logical_id(v)
 
 
 DeviceSettings = Annotated[

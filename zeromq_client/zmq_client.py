@@ -19,12 +19,12 @@ class ZeroMqClient:
     collector → gateway: PUB (data / health / ack)
     gateway → collector: SUB (cmd_r / cmd_w)
 
-    토픽: collector.plc.{collector_address}.{msg_type}
+    토픽: collector.plc.{devices[].id}.{msg_type}
     """
 
-    def __init__(self, settings: ZmqSettings, *, collector_address: str):
+    def __init__(self, settings: ZmqSettings, *, device_ids: list[str]):
         self.settings = settings
-        self.collector_address = collector_address
+        self.device_ids = list(device_ids)
         self._lock = threading.Lock()
         self._pub = ZmqPubClient(
             settings.pub_endpoint,
@@ -35,7 +35,7 @@ class ZeroMqClient:
             settings.sub_endpoint,
             bind=settings.sub_bind,
             linger_ms=settings.linger_ms,
-            topic=cmd_subscribe_prefix(collector_address),
+            topics=[cmd_subscribe_prefix(d) for d in self.device_ids],
             recv_timeout_ms=settings.recv_timeout_ms,
         )
 
@@ -47,12 +47,12 @@ class ZeroMqClient:
             self._pub.close()
             raise
         logger.info(
-            "ZeroMQ ready pub=%s(%s) sub=%s(%s) sub_topic=%s",
+            "ZeroMQ ready pub=%s(%s) sub=%s(%s) devices=%s",
             self.settings.pub_endpoint,
             "bind" if self.settings.pub_bind else "connect",
             self.settings.sub_endpoint,
             "bind" if self.settings.sub_bind else "connect",
-            cmd_subscribe_prefix(self.collector_address),
+            self.device_ids,
         )
 
     def close(self) -> None:
@@ -62,7 +62,7 @@ class ZeroMqClient:
 
     def send(self, header: ProtocolHeaderDTO, *, topic: str | None = None) -> None:
         t = topic if topic is not None else topic_for(
-            self.collector_address, header.msg_type
+            header.collector_address, header.msg_type
         )
         with self._lock:
             self._pub.send(header, topic=t)

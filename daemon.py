@@ -245,10 +245,14 @@ def emit_ack(cfg: Settings, body: MsgAckDTO) -> None:
 
 def _emit_protocol(cfg: Settings, *, msg_type: MsgTypeEnum, body: dict) -> None:
     """헤더를 씌워 로그하고 ZeroMQ PUB으로 보낸다."""
+    # devices[].id → collector_address / topic 세그먼트
+    collector_address = body.get("device_id")
+    if not collector_address:
+        raise ValueError(f"{msg_type.value} body에 device_id(collector_address) 없음")
     header = ProtocolHeaderDTO(
         msg_id=uuid4(),
         gateway_address=cfg.app.gateway_address,
-        collector_address=cfg.app.collector_address,
+        collector_address=str(collector_address),
         msg_type=msg_type,
         msg_body=body,
         timestamp_ms=now_ms(),
@@ -409,7 +413,10 @@ def run(cfg: Settings | None = None) -> None:
         cfg.app.reconnect_period_ms,
     )
 
-    zmq = ZeroMqClient(cfg.app.zmq, collector_address=cfg.app.collector_address)
+    zmq = ZeroMqClient(
+        cfg.app.zmq,
+        device_ids=[d.id for d in cfg.devices],
+    )
     try:
         zmq.connect()
     except Exception as e:
