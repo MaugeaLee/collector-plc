@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Union
 from enum import StrEnum
 
+from model.error_model import ClientErrorCode
+
 
 class MsgTypeEnum(StrEnum):
     CMD_R = "cmd_r"
@@ -67,6 +69,8 @@ class MsgAckDTO(BaseModel):
     device_id: str
     action: Union[MsgCmdREnum, MsgCmdWEnum]
     status: MsgAckStatusEnum
+    # 정상은 E-0000, 그 외는 실패 사유 코드
+    code: ClientErrorCode = ClientErrorCode.OK
     reason: Optional[str] = None
     applied_ms: Optional[int] = None
     results: Optional[List[MsgWriteItemDTO]] = None

@@ -24,7 +24,7 @@ from client.rtu_client import RtuClient
 from client.tcp_client import TcpClient
 from config import save_devices, settings
 from model.client_model import DeviceSettings, Settings
-from model.error_model import ClientErrorCode
+from model.error_model import ClientErrorCategory, ClientErrorCode
 from model.protocol_model import (
     MsgAckDTO,
     MsgAckStatusEnum,
@@ -83,6 +83,14 @@ def _as_client_error(exc: BaseException) -> ClientError:
     return exc if isinstance(exc, ClientError) else to_client_error(exc)
 
 
+def _as_error_code(value: str | None) -> ClientErrorCode:
+    """와이어의 코드 문자열을 ClientErrorCode로 되돌린다."""
+    try:
+        return ClientErrorCode(value)
+    except ValueError:
+        return ClientErrorCode.UNKNOWN
+
+
 def _sleep_interruptible(
     seconds: float, wake: threading.Event | None = None
 ) -> None:
@@ -107,14 +115,15 @@ def _safe_close(client: BaseClient) -> None:
 
 def read_addr(client: BaseClient, addr: str) -> int:
     """주소 문자열 한 건을 읽어 정수로 반환한다."""
+    # MC: D/R/M/X… 문자열을 그대로 디바이스 지정
+    if hasattr(client, "read_device"):
+        return int(client.read_device(addr, 1)[0])
+
     kind = addr[0].upper()
     num = int(addr[1:])
 
     if kind == "D":
         return int(client.read_holding_registers(num, count=1)[0])
-
-    if hasattr(client, "read_bits") and kind in ("M", "X", "Y"):
-        return int(client.read_bits(addr, 1)[0])
 
     raise ClientError(
         ClientErrorCode.UNSUPPORTED_ADDR,
@@ -124,15 +133,15 @@ def read_addr(client: BaseClient, addr: str) -> int:
 
 def write_addr(client: BaseClient, addr: str, value: int) -> None:
     """주소 문자열 한 건에 값을 쓴다."""
+    if hasattr(client, "write_device"):
+        client.write_device(addr, [int(value)])
+        return
+
     kind = addr[0].upper()
     num = int(addr[1:])
 
     if kind == "D":
         client.write_register(num, value)
-        return
-
-    if hasattr(client, "write_bits") and kind in ("M", "X", "Y"):
-        client.write_bits(addr, [int(value)])
         return
 
     raise ClientError(
@@ -143,7 +152,11 @@ def write_addr(client: BaseClient, addr: str, value: int) -> None:
 
 def _addr_soft_error_code(err: ClientError, *, write: bool) -> str:
     """번지 soft-fail용 에러 코드 문자열을 고른다."""
-    if err.code is ClientErrorCode.UNSUPPORTED_ADDR:
+    # 의미가 분명한 번지 오류는 그대로 노출 (E-2201/2202로 덮지 않음)
+    if err.code in (
+        ClientErrorCode.UNSUPPORTED_ADDR,
+        ClientErrorCode.ADDR_OUT_OF_RANGE,
+    ):
         return err.code.value
     return (
         ClientErrorCode.ADDR_WRITE_FAILED.value
@@ -220,15 +233,18 @@ def build_write_ack(
     failed = [r for r in results if r.error]
     if not failed:
         status = MsgAckStatusEnum.OK
+        code = ClientErrorCode.OK
         reason = None
     else:
         status = MsgAckStatusEnum.ERROR
+        code = _as_error_code(failed[0].error)
         reason = failed[0].error
     return MsgAckDTO(
         ref_msg_id=ref_msg_id,
         device_id=device_id,
         action=action,
         status=status,
+        code=code,
         reason=reason,
         applied_ms=now_ms(),
         results=results,
@@ -363,9 +379,23 @@ def _snapshot_devices(slots: dict[str, DeviceSlot]) -> list[DeviceSettings]:
     return out
 
 
-def _persist_slots(slots: dict[str, DeviceSlot]) -> None:
+def _persist_slots(
+    slots: dict[str, DeviceSlot], *, override: DeviceSettings | None = None
+) -> None:
     """런타임 devices[]를 plc_setting.json에 저장한다."""
-    save_devices(_snapshot_devices(slots))
+    devices = _snapshot_devices(slots)
+    if override is not None:
+        devices = [override if d.id == override.id else d for d in devices]
+    save_devices(devices)
+
+
+def _ack_status(code: ClientErrorCode) -> MsgAckStatusEnum:
+    """요청 결함은 rejected, 처리 중 실패는 error로 구분한다."""
+    if code.is_ok:
+        return MsgAckStatusEnum.OK
+    if code.category is ClientErrorCategory.REQUEST:
+        return MsgAckStatusEnum.REJECTED
+    return MsgAckStatusEnum.ERROR
 
 
 def _emit_cmd_ack(
@@ -374,9 +404,10 @@ def _emit_cmd_ack(
     ref_msg_id: UUID,
     device_id: str,
     action: MsgCmdREnum | MsgCmdWEnum,
-    status: MsgAckStatusEnum,
+    code: ClientErrorCode = ClientErrorCode.OK,
     reason: str | None = None,
 ) -> None:
+    status = _ack_status(code)
     emit_ack(
         cfg,
         MsgAckDTO(
@@ -384,122 +415,40 @@ def _emit_cmd_ack(
             device_id=device_id,
             action=action,
             status=status,
-            reason=reason,
+            code=code,
+            reason=reason or (None if code.is_ok else code.label),
             applied_ms=now_ms() if status is MsgAckStatusEnum.OK else None,
             results=None,
         ),
     )
 
 
-def _apply_set_scan(
+def _commit_device(
     cfg: Settings,
     slots: dict[str, DeviceSlot],
+    slot: DeviceSlot,
     header: ProtocolHeaderDTO,
     body: MsgCmdRDTO,
+    data: dict,
+    *,
+    reload_client: bool,
 ) -> None:
-    """스캔 주소/주기만 반영하고 파일을 저장한다 (재연결 없음)."""
-    slot = slots.get(body.device_id)
-    if slot is None:
-        _emit_cmd_ack(
-            cfg,
-            ref_msg_id=header.msg_id,
-            device_id=body.device_id,
-            action=body.action,
-            status=MsgAckStatusEnum.REJECTED,
-            reason="unknown_device",
-        )
-        return
-    if body.d_address is None and body.period_ms is None:
-        _emit_cmd_ack(
-            cfg,
-            ref_msg_id=header.msg_id,
-            device_id=body.device_id,
-            action=body.action,
-            status=MsgAckStatusEnum.REJECTED,
-            reason="empty_set_scan",
-        )
-        return
-
-    with slot.lock:
-        if body.d_address is not None:
-            slot.device.scan_addresses = list(body.d_address)
-        if body.period_ms is not None:
-            slot.device.scan_period_ms = int(body.period_ms)
-
+    """설정 dict를 검증 → 저장 → 슬롯 반영 순으로 커밋하고 ACK를 낸다."""
     try:
-        _persist_slots(slots)
-    except Exception as e:
-        err = _as_client_error(e)
-        logger.error(
-            "[%s] SET_SCAN persist failed: %s",
-            body.device_id,
-            err.detail or err,
-        )
-        _emit_cmd_ack(
-            cfg,
-            ref_msg_id=header.msg_id,
-            device_id=body.device_id,
-            action=body.action,
-            status=MsgAckStatusEnum.ERROR,
-            reason=err.code.value,
-        )
-        return
-
-    logger.info(
-        "[%s] SET_SCAN applied addrs=%s period_ms=%s",
-        body.device_id,
-        body.d_address,
-        body.period_ms,
-    )
-    _emit_cmd_ack(
-        cfg,
-        ref_msg_id=header.msg_id,
-        device_id=body.device_id,
-        action=body.action,
-        status=MsgAckStatusEnum.OK,
-    )
-
-
-def _apply_set_device(
-    cfg: Settings,
-    slots: dict[str, DeviceSlot],
-    header: ProtocolHeaderDTO,
-    body: MsgCmdRDTO,
-) -> None:
-    """전체 DeviceSettings를 반영하고 close→rebuild를 요청한다."""
-    slot = slots.get(body.device_id)
-    if slot is None:
-        _emit_cmd_ack(
-            cfg,
-            ref_msg_id=header.msg_id,
-            device_id=body.device_id,
-            action=body.action,
-            status=MsgAckStatusEnum.REJECTED,
-            reason="unknown_device",
-        )
-        return
-    if not body.device_setup:
-        _emit_cmd_ack(
-            cfg,
-            ref_msg_id=header.msg_id,
-            device_id=body.device_id,
-            action=body.action,
-            status=MsgAckStatusEnum.REJECTED,
-            reason="missing_device",
-        )
-        return
-
-    try:
-        new_device = _device_adapter.validate_python(body.device_setup)
+        new_device = _device_adapter.validate_python(data)
     except ValidationError as e:
-        logger.warning("[%s] SET_DEVICE invalid: %s", body.device_id, e)
+        logger.warning(
+            "[%s] %s invalid device setup: %s",
+            body.device_id,
+            body.action.value,
+            e,
+        )
         _emit_cmd_ack(
             cfg,
             ref_msg_id=header.msg_id,
             device_id=body.device_id,
             action=body.action,
-            status=MsgAckStatusEnum.REJECTED,
-            reason="invalid_device",
+            code=ClientErrorCode.INVALID_CONFIG,
         )
         return
 
@@ -509,22 +458,20 @@ def _apply_set_device(
             ref_msg_id=header.msg_id,
             device_id=body.device_id,
             action=body.action,
-            status=MsgAckStatusEnum.REJECTED,
-            reason="device_id_mismatch",
+            code=ClientErrorCode.CMD_DEVICE_MISMATCH,
+            reason=f"device_setup.id={new_device.id}",
         )
         return
 
-    with slot.lock:
-        slot.device = new_device
-        slot.reload.set()
-
+    # 저장이 실패하면 런타임도 바꾸지 않는다 (파일·메모리 불일치 방지)
     try:
-        _persist_slots(slots)
+        _persist_slots(slots, override=new_device)
     except Exception as e:
         err = _as_client_error(e)
         logger.error(
-            "[%s] SET_DEVICE persist failed: %s",
+            "[%s] %s persist failed: %s",
             body.device_id,
+            body.action.value,
             err.detail or err,
         )
         _emit_cmd_ack(
@@ -532,22 +479,105 @@ def _apply_set_device(
             ref_msg_id=header.msg_id,
             device_id=body.device_id,
             action=body.action,
-            status=MsgAckStatusEnum.ERROR,
+            code=ClientErrorCode.CONFIG_SAVE_FAILED,
             reason=err.code.value,
         )
         return
 
+    with slot.lock:
+        slot.device = new_device
+        if reload_client:
+            slot.reload.set()
+
     logger.info(
-        "[%s] SET_DEVICE applied mode=%s (reload requested)",
+        "[%s] %s applied addrs=%s period_ms=%s reload=%s",
         body.device_id,
-        new_device.mode,
+        body.action.value,
+        new_device.scan_addresses,
+        new_device.scan_period_ms,
+        reload_client,
     )
     _emit_cmd_ack(
         cfg,
         ref_msg_id=header.msg_id,
         device_id=body.device_id,
         action=body.action,
-        status=MsgAckStatusEnum.OK,
+    )
+
+
+def _apply_set_scan(
+    cfg: Settings,
+    slots: dict[str, DeviceSlot],
+    slot: DeviceSlot,
+    header: ProtocolHeaderDTO,
+    body: MsgCmdRDTO,
+) -> None:
+    """스캔 주소/주기만 반영한다 (재연결 없음)."""
+    if body.d_address is None and body.period_ms is None:
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            code=ClientErrorCode.CMD_FIELD_MISSING,
+            reason="d_address/period_ms 없음",
+        )
+        return
+
+    with slot.lock:
+        data = slot.device.model_dump(mode="json")
+    if body.d_address is not None:
+        data["scan_addresses"] = list(body.d_address)
+    if body.period_ms is not None:
+        data["scan_period_ms"] = body.period_ms
+
+    _commit_device(cfg, slots, slot, header, body, data, reload_client=False)
+
+
+def _apply_set_device(
+    cfg: Settings,
+    slots: dict[str, DeviceSlot],
+    slot: DeviceSlot,
+    header: ProtocolHeaderDTO,
+    body: MsgCmdRDTO,
+) -> None:
+    """전체 DeviceSettings를 반영하고 close→rebuild를 요청한다."""
+    if not body.device_setup:
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            code=ClientErrorCode.CMD_FIELD_MISSING,
+            reason="device_setup 없음",
+        )
+        return
+
+    _commit_device(
+        cfg,
+        slots,
+        slot,
+        header,
+        body,
+        dict(body.device_setup),
+        reload_client=True,
+    )
+
+
+def _emit_body_invalid_ack(cfg: Settings, header: ProtocolHeaderDTO) -> None:
+    """본문 파싱 실패 ACK. action조차 못 읽으면 로그만 남긴다."""
+    raw_action = (header.msg_body or {}).get("action")
+    try:
+        action = MsgCmdREnum(raw_action)
+    except ValueError:
+        logger.warning("cmd_r action 판별 불가, ack 생략: %r", raw_action)
+        return
+    _emit_cmd_ack(
+        cfg,
+        ref_msg_id=header.msg_id,
+        device_id=header.collector_address,
+        action=action,
+        code=ClientErrorCode.CMD_BODY_INVALID,
     )
 
 
@@ -556,24 +586,59 @@ def _handle_cmd_r(
     slots: dict[str, DeviceSlot],
     header: ProtocolHeaderDTO,
 ) -> None:
-    """cmd_r 본문을 파싱해 SET_SCAN / SET_DEVICE만 처리한다."""
+    """cmd_r 공통 검증 후 SET_SCAN / SET_DEVICE만 처리한다."""
     try:
         body = MsgCmdRDTO.model_validate(header.msg_body)
     except ValidationError as e:
-        logger.warning("cmd_r parse failed: %s", e)
+        logger.warning("cmd_r body invalid: %s", e)
+        _emit_body_invalid_ack(cfg, header)
+        return
+
+    if body.device_id != header.collector_address:
+        logger.warning(
+            "cmd_r device_id 불일치: topic=%s body=%s",
+            header.collector_address,
+            body.device_id,
+        )
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=header.collector_address,
+            action=body.action,
+            code=ClientErrorCode.CMD_DEVICE_MISMATCH,
+            reason=f"body.device_id={body.device_id}",
+        )
+        return
+
+    slot = slots.get(body.device_id)
+    if slot is None:
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            code=ClientErrorCode.CMD_UNKNOWN_DEVICE,
+        )
         return
 
     if body.action is MsgCmdREnum.SET_SCAN:
-        _apply_set_scan(cfg, slots, header, body)
+        _apply_set_scan(cfg, slots, slot, header, body)
         return
     if body.action is MsgCmdREnum.SET_DEVICE:
-        _apply_set_device(cfg, slots, header, body)
+        _apply_set_device(cfg, slots, slot, header, body)
         return
 
-    logger.debug(
-        "[%s] cmd_r action ignored: %s",
+    logger.info(
+        "[%s] cmd_r action not implemented: %s",
         body.device_id,
         body.action.value,
+    )
+    _emit_cmd_ack(
+        cfg,
+        ref_msg_id=header.msg_id,
+        device_id=body.device_id,
+        action=body.action,
+        code=ClientErrorCode.CMD_UNSUPPORTED_ACTION,
     )
 
 

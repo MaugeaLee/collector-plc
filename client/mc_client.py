@@ -5,10 +5,13 @@ BaseClient의 읽기/쓰기 API는 그대로 쓰되, 내부에서 아래 디바�
   coil                  -> M
   discrete input        -> X
 
-실제 현장 주소(D100, Y10 등)는 read_words / write_words / read_bits / write_bits 를 쓰면 된다.
+현장 주소 문자열(D100, R0, M10, Y10 등)은 read_device / write_device
+또는 read_words / write_words / read_bits / write_bits 로 지정한다.
 """
 
 from __future__ import annotations
+
+import re
 
 from pymcprotocol import Type3E
 
@@ -16,6 +19,25 @@ from client.base_client import BaseClient
 from client.errors import ClientError, to_client_error
 from model.client_model import McSettings
 from model.error_model import ClientErrorCode
+
+# pymcprotocol headdevice: 디바이스명 + 10진 번호 (예: D100, ZR0, M10)
+_ADDR_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+# 워드 단위 접근
+_WORD_DEVICES = frozenset({"D", "W", "R", "ZR", "SD", "SW", "Z"})
+# 비트 단위 접근
+_BIT_DEVICES = frozenset({"M", "X", "Y", "B", "L", "F", "SM"})
+
+
+def parse_mc_addr(addr: str) -> tuple[str, int]:
+    """'D100' / 'R0' / 'ZR10' → (디바이스, 번호)."""
+    m = _ADDR_RE.match(addr.strip())
+    if not m:
+        raise ClientError(
+            ClientErrorCode.UNSUPPORTED_ADDR,
+            f"지원하지 않는 주소 형식: {addr}",
+        )
+    return m.group(1).upper(), int(m.group(2))
 
 
 class McClient(BaseClient):
@@ -77,6 +99,34 @@ class McClient(BaseClient):
             lambda: self.client.batchwrite_bitunits(
                 headdevice=headdevice, values=values
             ),
+        )
+
+    def read_device(self, addr: str, count: int = 1) -> list[int]:
+        """주소 문자열(D100, R0, M10 …)을 읽어 정수 리스트로 반환한다."""
+        kind, num = parse_mc_addr(addr)
+        head = f"{kind}{num}"
+        if kind in _WORD_DEVICES:
+            return [int(v) for v in self.read_words(head, count)]
+        if kind in _BIT_DEVICES:
+            return [int(v) for v in self.read_bits(head, count)]
+        raise ClientError(
+            ClientErrorCode.UNSUPPORTED_ADDR,
+            f"지원하지 않는 주소: {addr}",
+        )
+
+    def write_device(self, addr: str, values: list[int]) -> None:
+        """주소 문자열에 값을 쓴다. values 길이가 연속 워드/비트 개수."""
+        kind, num = parse_mc_addr(addr)
+        head = f"{kind}{num}"
+        if kind in _WORD_DEVICES:
+            self.write_words(head, [int(v) for v in values])
+            return
+        if kind in _BIT_DEVICES:
+            self.write_bits(head, [int(v) for v in values])
+            return
+        raise ClientError(
+            ClientErrorCode.UNSUPPORTED_ADDR,
+            f"지원하지 않는 주소: {addr}",
         )
 
     def read_holding_registers(self, address: int, count: int = 1):

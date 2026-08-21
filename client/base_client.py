@@ -102,5 +102,8 @@ class BaseClient:
 
 def _unwrap(result, code: ClientErrorCode):
     if result.isError():
-        raise ClientError(code, str(result))
+        detail = str(result)
+        if getattr(result, "exception_code", None) == 2:
+            raise ClientError(ClientErrorCode.ADDR_OUT_OF_RANGE, detail)
+        raise ClientError(code, detail)
     return result
