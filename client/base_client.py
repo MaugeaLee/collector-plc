@@ -2,12 +2,10 @@
 
 from pymodbus.exceptions import ModbusException
 
-import config
-
 
 class BaseClient:
-    def __init__(self):
-        self.device_id = config.PLC_DEVICE_ID
+    def __init__(self, device_id: int):
+        self.device_id = device_id
         self.client = self._build_client()
 
     def _build_client(self):
