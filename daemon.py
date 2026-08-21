@@ -12,19 +12,24 @@ import logging
 import signal
 import threading
 import time
+from dataclasses import dataclass, field
 from uuid import UUID, uuid4
+
+from pydantic import TypeAdapter, ValidationError
 
 from client.base_client import BaseClient
 from client.errors import ClientError, to_client_error
 from client.mc_client import McClient
 from client.rtu_client import RtuClient
 from client.tcp_client import TcpClient
-from config import settings
+from config import save_devices, settings
 from model.client_model import DeviceSettings, Settings
 from model.error_model import ClientErrorCode
 from model.protocol_model import (
     MsgAckDTO,
     MsgAckStatusEnum,
+    MsgCmdREnum,
+    MsgCmdRDTO,
     MsgCmdWEnum,
     MsgDataDTO,
     MsgHealthDTO,
@@ -39,6 +44,16 @@ logger = logging.getLogger(__name__)
 
 _running = True
 _zmq: ZeroMqClient | None = None
+_device_adapter = TypeAdapter(DeviceSettings)
+
+
+@dataclass
+class DeviceSlot:
+    """디바이스 워커가 공유하는 최신 설정·리로드 신호."""
+
+    device: DeviceSettings
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    reload: threading.Event = field(default_factory=threading.Event)
 
 
 def _on_signal(signum, frame):
@@ -68,10 +83,14 @@ def _as_client_error(exc: BaseException) -> ClientError:
     return exc if isinstance(exc, ClientError) else to_client_error(exc)
 
 
-def _sleep_interruptible(seconds: float) -> None:
-    """종료 시그널에 끊길 수 있게 짧게 나눠 잔다."""
+def _sleep_interruptible(
+    seconds: float, wake: threading.Event | None = None
+) -> None:
+    """종료 시그널(및 선택적 wake)에 끊길 수 있게 짧게 나눠 잔다."""
     deadline = time.monotonic() + max(0.0, seconds)
     while _running:
+        if wake is not None and wake.is_set():
+            break
         remain = deadline - time.monotonic()
         if remain <= 0:
             break
@@ -303,7 +322,6 @@ def scan_once(
         device_id=device.id,
         sample_ms=now_ms(),
         samples=samples,
-        ref_msg_id=None,
     )
 
 
@@ -336,10 +354,259 @@ def ensure_connected(
     return False
 
 
-def run_device(cfg: Settings, device: DeviceSettings) -> None:
-    """단일 디바이스의 연결·스캔·재연결 루프를 돌린다."""
-    period_s = device.scan_period_ms / 1000.0
+def _snapshot_devices(slots: dict[str, DeviceSlot]) -> list[DeviceSettings]:
+    """슬롯의 최신 device 스냅샷 목록."""
+    out: list[DeviceSettings] = []
+    for slot in slots.values():
+        with slot.lock:
+            out.append(slot.device.model_copy(deep=True))
+    return out
+
+
+def _persist_slots(slots: dict[str, DeviceSlot]) -> None:
+    """런타임 devices[]를 plc_setting.json에 저장한다."""
+    save_devices(_snapshot_devices(slots))
+
+
+def _emit_cmd_ack(
+    cfg: Settings,
+    *,
+    ref_msg_id: UUID,
+    device_id: str,
+    action: MsgCmdREnum | MsgCmdWEnum,
+    status: MsgAckStatusEnum,
+    reason: str | None = None,
+) -> None:
+    emit_ack(
+        cfg,
+        MsgAckDTO(
+            ref_msg_id=ref_msg_id,
+            device_id=device_id,
+            action=action,
+            status=status,
+            reason=reason,
+            applied_ms=now_ms() if status is MsgAckStatusEnum.OK else None,
+            results=None,
+        ),
+    )
+
+
+def _apply_set_scan(
+    cfg: Settings,
+    slots: dict[str, DeviceSlot],
+    header: ProtocolHeaderDTO,
+    body: MsgCmdRDTO,
+) -> None:
+    """스캔 주소/주기만 반영하고 파일을 저장한다 (재연결 없음)."""
+    slot = slots.get(body.device_id)
+    if slot is None:
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            status=MsgAckStatusEnum.REJECTED,
+            reason="unknown_device",
+        )
+        return
+    if body.d_address is None and body.period_ms is None:
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            status=MsgAckStatusEnum.REJECTED,
+            reason="empty_set_scan",
+        )
+        return
+
+    with slot.lock:
+        if body.d_address is not None:
+            slot.device.scan_addresses = list(body.d_address)
+        if body.period_ms is not None:
+            slot.device.scan_period_ms = int(body.period_ms)
+
+    try:
+        _persist_slots(slots)
+    except Exception as e:
+        err = _as_client_error(e)
+        logger.error(
+            "[%s] SET_SCAN persist failed: %s",
+            body.device_id,
+            err.detail or err,
+        )
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            status=MsgAckStatusEnum.ERROR,
+            reason=err.code.value,
+        )
+        return
+
+    logger.info(
+        "[%s] SET_SCAN applied addrs=%s period_ms=%s",
+        body.device_id,
+        body.d_address,
+        body.period_ms,
+    )
+    _emit_cmd_ack(
+        cfg,
+        ref_msg_id=header.msg_id,
+        device_id=body.device_id,
+        action=body.action,
+        status=MsgAckStatusEnum.OK,
+    )
+
+
+def _apply_set_device(
+    cfg: Settings,
+    slots: dict[str, DeviceSlot],
+    header: ProtocolHeaderDTO,
+    body: MsgCmdRDTO,
+) -> None:
+    """전체 DeviceSettings를 반영하고 close→rebuild를 요청한다."""
+    slot = slots.get(body.device_id)
+    if slot is None:
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            status=MsgAckStatusEnum.REJECTED,
+            reason="unknown_device",
+        )
+        return
+    if not body.device_setup:
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            status=MsgAckStatusEnum.REJECTED,
+            reason="missing_device",
+        )
+        return
+
+    try:
+        new_device = _device_adapter.validate_python(body.device_setup)
+    except ValidationError as e:
+        logger.warning("[%s] SET_DEVICE invalid: %s", body.device_id, e)
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            status=MsgAckStatusEnum.REJECTED,
+            reason="invalid_device",
+        )
+        return
+
+    if new_device.id != body.device_id:
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            status=MsgAckStatusEnum.REJECTED,
+            reason="device_id_mismatch",
+        )
+        return
+
+    with slot.lock:
+        slot.device = new_device
+        slot.reload.set()
+
+    try:
+        _persist_slots(slots)
+    except Exception as e:
+        err = _as_client_error(e)
+        logger.error(
+            "[%s] SET_DEVICE persist failed: %s",
+            body.device_id,
+            err.detail or err,
+        )
+        _emit_cmd_ack(
+            cfg,
+            ref_msg_id=header.msg_id,
+            device_id=body.device_id,
+            action=body.action,
+            status=MsgAckStatusEnum.ERROR,
+            reason=err.code.value,
+        )
+        return
+
+    logger.info(
+        "[%s] SET_DEVICE applied mode=%s (reload requested)",
+        body.device_id,
+        new_device.mode,
+    )
+    _emit_cmd_ack(
+        cfg,
+        ref_msg_id=header.msg_id,
+        device_id=body.device_id,
+        action=body.action,
+        status=MsgAckStatusEnum.OK,
+    )
+
+
+def _handle_cmd_r(
+    cfg: Settings,
+    slots: dict[str, DeviceSlot],
+    header: ProtocolHeaderDTO,
+) -> None:
+    """cmd_r 본문을 파싱해 SET_SCAN / SET_DEVICE만 처리한다."""
+    try:
+        body = MsgCmdRDTO.model_validate(header.msg_body)
+    except ValidationError as e:
+        logger.warning("cmd_r parse failed: %s", e)
+        return
+
+    if body.action is MsgCmdREnum.SET_SCAN:
+        _apply_set_scan(cfg, slots, header, body)
+        return
+    if body.action is MsgCmdREnum.SET_DEVICE:
+        _apply_set_device(cfg, slots, header, body)
+        return
+
+    logger.debug(
+        "[%s] cmd_r action ignored: %s",
+        body.device_id,
+        body.action.value,
+    )
+
+
+def _dispatch_sub(
+    cfg: Settings,
+    slots: dict[str, DeviceSlot],
+    header: ProtocolHeaderDTO,
+) -> None:
+    """SUB로 받은 헤더를 로그하고, 구현된 타입만 처리한다."""
+    # DATA/HEALTH/ACK PUB와 동일하게 전문을 INFO로 남긴다 (수신 경로)
+    logger.info(
+        "[SUB %s] %s",
+        header.msg_type.value.upper(),
+        header.model_dump_json(),
+    )
+
+    if header.msg_type is MsgTypeEnum.CMD_R:
+        _handle_cmd_r(cfg, slots, header)
+        return
+    if header.msg_type is MsgTypeEnum.CMD_W:
+        # 처리 로직은 아직 없음 — 수신 로그만
+        return
+    if header.msg_type in (MsgTypeEnum.ACK, MsgTypeEnum.HEALTH):
+        # collector는 보통 PUB만 하지만, SUB로 들어오면 로그만
+        return
+    logger.debug("sub ignore msg_type=%s", header.msg_type.value)
+
+
+def run_device(cfg: Settings, slot: DeviceSlot) -> None:
+    """단일 디바이스의 연결·스캔·재연결·설정 리로드 루프를 돌린다."""
     reconnect_s = cfg.app.reconnect_period_ms / 1000.0
+    with slot.lock:
+        device = slot.device.model_copy(deep=True)
     client = build_client(device)
 
     logger.info(
@@ -353,10 +620,27 @@ def run_device(cfg: Settings, device: DeviceSettings) -> None:
 
     try:
         while _running:
+            with slot.lock:
+                device = slot.device.model_copy(deep=True)
+                slot.reload.clear()
+
             if not ensure_connected(cfg, device, client, reconnect_s):
                 break
 
             while _running:
+                if slot.reload.is_set():
+                    logger.info("[%s] reloading client settings", device.id)
+                    _safe_close(client)
+                    with slot.lock:
+                        device = slot.device.model_copy(deep=True)
+                        slot.reload.clear()
+                    client = build_client(device)
+                    break
+
+                with slot.lock:
+                    device = slot.device.model_copy(deep=True)
+                period_s = device.scan_period_ms / 1000.0
+
                 started = time.monotonic()
                 try:
                     data = scan_once(device, client)
@@ -394,28 +678,30 @@ def run_device(cfg: Settings, device: DeviceSettings) -> None:
                 elapsed = time.monotonic() - started
                 remain = period_s - elapsed
                 if remain > 0 and _running:
-                    _sleep_interruptible(remain)
+                    _sleep_interruptible(remain, wake=slot.reload)
     finally:
         _safe_close(client)
         logger.info("[%s] worker stop", device.id)
 
 
 def run(cfg: Settings | None = None) -> None:
-    """ZeroMQ를 열고 디바이스 워커를 띄운 뒤 종료까지 대기한다."""
+    """ZeroMQ를 열고 디바이스 워커·SUB 디스패치를 돌린다."""
     global _running, _zmq
     cfg = cfg or settings
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
+    slots = {d.id: DeviceSlot(device=d) for d in cfg.devices}
+
     logger.info(
         "daemon start devices=%s reconnect_ms=%s",
-        [d.id for d in cfg.devices],
+        list(slots.keys()),
         cfg.app.reconnect_period_ms,
     )
 
     zmq = ZeroMqClient(
         cfg.app.zmq,
-        device_ids=[d.id for d in cfg.devices],
+        device_ids=list(slots.keys()),
     )
     try:
         zmq.connect()
@@ -433,18 +719,41 @@ def run(cfg: Settings | None = None) -> None:
     threads = [
         threading.Thread(
             target=run_device,
-            args=(cfg, device),
-            name=f"plc-{device.id}",
+            args=(cfg, slot),
+            name=f"plc-{device_id}",
             daemon=True,
         )
-        for device in cfg.devices
+        for device_id, slot in slots.items()
     ]
     for t in threads:
         t.start()
 
     try:
         while _running:
-            time.sleep(0.2)
+            try:
+                header = zmq.recv()
+            except Exception as e:
+                err = _as_client_error(e)
+                logger.warning(
+                    "zmq sub failed: %s(%s) %s",
+                    err.code.value,
+                    err.code.label,
+                    err.detail or err,
+                )
+                _sleep_interruptible(0.2)
+                continue
+            if header is None:
+                continue
+            try:
+                _dispatch_sub(cfg, slots, header)
+            except Exception as e:
+                err = _as_client_error(e)
+                logger.error(
+                    "cmd dispatch failed: %s(%s) %s",
+                    err.code.value,
+                    err.code.label,
+                    err.detail or err,
+                )
     finally:
         _running = False
         for t in threads:

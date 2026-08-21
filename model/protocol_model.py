@@ -14,6 +14,7 @@ class MsgTypeEnum(StrEnum):
 
 class MsgCmdREnum(StrEnum):
     SET_SCAN = "SET_SCAN"
+    SET_DEVICE = "SET_DEVICE"
     READ_ONCE = "READ_ONCE"
     STOP = "STOP"
 
@@ -43,6 +44,8 @@ class MsgCmdRDTO(BaseModel):
     action: MsgCmdREnum
     d_address: Optional[List[str]] = None
     period_ms: Optional[int] = None
+    # SET_DEVICE: DeviceSettings와 동일 스키마 (id는 device_id와 일치)
+    device_setup: Optional[dict] = None
     deadline_ms: int
 
 
@@ -87,4 +90,3 @@ class MsgDataDTO(BaseModel):
     device_id: str
     sample_ms: int
     samples: List[MsgSampleDTO]
-    ref_msg_id: Optional[UUID] = None

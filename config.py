@@ -16,7 +16,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from model.client_model import AppSettings, DevicesFile, Settings, ZmqSettings
+from model.client_model import (
+    AppSettings,
+    DeviceSettings,
+    DevicesFile,
+    Settings,
+    ZmqSettings,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -84,6 +90,22 @@ def _load_app_from_env() -> AppSettings:
 
 def load_settings() -> Settings:
     return Settings(app=_load_app_from_env(), devices=_load_devices_from_json())
+
+
+def save_devices(
+    devices: list[DeviceSettings], path: Path | None = None
+) -> None:
+    """devices[]를 plc_setting.json에 원자적으로 저장한다."""
+    path = path or _plc_config_path()
+    try:
+        payload = DevicesFile(devices=devices).model_dump(mode="json")
+    except ValidationError as e:
+        raise ValueError(f"PLC 설정 검증 실패(저장): {path}: {e}") from e
+
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 settings = load_settings()
