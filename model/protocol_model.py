@@ -49,6 +49,7 @@ class MsgCmdRDTO(BaseModel):
 class MsgWriteItemDTO(BaseModel):
     addr: str
     value: int
+    error: Optional[str] = None
 
 
 class MsgCmdWDTO(BaseModel):
@@ -65,6 +66,7 @@ class MsgAckDTO(BaseModel):
     status: MsgAckStatusEnum
     reason: Optional[str] = None
     applied_ms: Optional[int] = None
+    results: Optional[List[MsgWriteItemDTO]] = None
 
 
 class MsgHealthDTO(BaseModel):
@@ -77,7 +79,8 @@ class MsgHealthDTO(BaseModel):
 
 class MsgSampleDTO(BaseModel):
     addr: str
-    value: int
+    value: Optional[int] = None
+    error: Optional[str] = None
 
 
 class MsgDataDTO(BaseModel):

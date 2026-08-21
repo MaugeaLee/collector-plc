@@ -1,0 +1,28 @@
+{
+  "devices": [
+    {
+      "id": "plc-tcp-1",
+      "mode": "tcp",
+      "device_id": 1,
+      "timeout": 3,
+      "retries": 3,
+      "host": "127.0.0.1",
+      "port": 502,
+      "scan_addresses": ["D100"],
+      "scan_period_ms": 1000
+    },
+    {
+      "id": "plc-mc-1",
+      "mode": "mc",
+      "device_id": 1,
+      "timeout": 3,
+      "retries": 3,
+      "host": "127.0.0.1",
+      "port": 5000,
+      "plctype": "Q",
+      "commtype": "binary",
+      "scan_addresses": ["D100", "M10"],
+      "scan_period_ms": 500
+    }
+  ]
+}

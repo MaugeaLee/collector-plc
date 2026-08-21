@@ -8,10 +8,14 @@ BaseClient의 읽기/쓰기 API는 그대로 쓰되, 내부에서 아래 디바�
 실제 현장 주소(D100, Y10 등)는 read_words / write_words / read_bits / write_bits 를 쓰면 된다.
 """
 
+from __future__ import annotations
+
 from pymcprotocol import Type3E
 
 from client.base_client import BaseClient
+from client.errors import ClientError, to_client_error
 from model.client_model import McSettings
+from model.error_model import ClientErrorCode
 
 
 class McClient(BaseClient):
@@ -35,21 +39,45 @@ class McClient(BaseClient):
     def connect(self):
         try:
             self.client.connect(self.settings.host, self.settings.port)
-        except OSError as e:
-            raise ConnectionError(f"연결 실패: {self._target()}") from e
+        except Exception as e:
+            err = to_client_error(e, default=ClientErrorCode.CONNECT_FAILED)
+            raise ClientError(
+                err.code,
+                f"연결 실패: {self._target()}: {err.detail or e}",
+            ) from e
         return True
 
     def read_words(self, headdevice: str, count: int = 1):
-        return self.client.batchread_wordunits(headdevice=headdevice, readsize=count)
+        return self._mc_call(
+            ClientErrorCode.READ_FAILED,
+            lambda: self.client.batchread_wordunits(
+                headdevice=headdevice, readsize=count
+            ),
+        )
 
     def write_words(self, headdevice: str, values: list[int]):
-        self.client.batchwrite_wordunits(headdevice=headdevice, values=values)
+        self._mc_call(
+            ClientErrorCode.WRITE_FAILED,
+            lambda: self.client.batchwrite_wordunits(
+                headdevice=headdevice, values=values
+            ),
+        )
 
     def read_bits(self, headdevice: str, count: int = 1):
-        return self.client.batchread_bitunits(headdevice=headdevice, readsize=count)
+        return self._mc_call(
+            ClientErrorCode.READ_FAILED,
+            lambda: self.client.batchread_bitunits(
+                headdevice=headdevice, readsize=count
+            ),
+        )
 
     def write_bits(self, headdevice: str, values: list[int]):
-        self.client.batchwrite_bitunits(headdevice=headdevice, values=values)
+        self._mc_call(
+            ClientErrorCode.WRITE_FAILED,
+            lambda: self.client.batchwrite_bitunits(
+                headdevice=headdevice, values=values
+            ),
+        )
 
     def read_holding_registers(self, address: int, count: int = 1):
         return self.read_words(f"D{address}", count)
@@ -71,3 +99,11 @@ class McClient(BaseClient):
 
     def write_registers(self, address: int, values: list[int]):
         self.write_words(f"D{address}", values)
+
+    def _mc_call(self, default: ClientErrorCode, call):
+        try:
+            return call()
+        except ClientError:
+            raise
+        except Exception as e:
+            raise to_client_error(e, default=default) from e

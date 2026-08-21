@@ -4,18 +4,16 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AppSettings(BaseModel):
-    """프로세스 공통 (로깅, 게이트웨이, 스캔 기본값)."""
+    """프로세스 공통 (로깅, 게이트웨이, 재연결)."""
 
     log_level: str = "INFO"
     gateway_address: str = "gateway"
     collector_address: str = "collector-plc"
-    scan_device_id: str = "1"
-    scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
-    scan_period_ms: int = 1000
+    reconnect_period_ms: int = 5000
 
 
 class TcpSettings(BaseModel):
@@ -57,6 +55,46 @@ PlcSettings = Annotated[
 ]
 
 
+class TcpDevice(TcpSettings):
+    """연결 + 스캔 설정을 포함한 디바이스."""
+
+    id: str
+    scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
+    scan_period_ms: int = 1000
+
+
+class RtuDevice(RtuSettings):
+    id: str
+    scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
+    scan_period_ms: int = 1000
+
+
+class McDevice(McSettings):
+    id: str
+    scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
+    scan_period_ms: int = 1000
+
+
+DeviceSettings = Annotated[
+    Union[TcpDevice, RtuDevice, McDevice],
+    Field(discriminator="mode"),
+]
+
+
+class DevicesFile(BaseModel):
+    """plc_setting.json 루트."""
+
+    devices: list[DeviceSettings] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _unique_ids(self) -> DevicesFile:
+        ids = [d.id for d in self.devices]
+        dup = {i for i in ids if ids.count(i) > 1}
+        if dup:
+            raise ValueError(f"device id 중복: {sorted(dup)}")
+        return self
+
+
 class Settings(BaseModel):
     app: AppSettings
-    plc: PlcSettings
+    devices: list[DeviceSettings]

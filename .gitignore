@@ -10,3 +10,5 @@ __pycache__/
 .idea/
 .vscode/
 *.log
+
+plc_setting.json
