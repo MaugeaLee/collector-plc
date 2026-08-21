@@ -16,7 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from model.client_model import AppSettings, DevicesFile, Settings
+from model.client_model import AppSettings, DevicesFile, Settings, ZmqSettings
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -61,12 +61,25 @@ def _load_devices_from_json(path: Path | None = None) -> list:
         raise ValueError(f"PLC 설정 검증 실패: {path}: {e}") from e
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = _env_str(key, "true" if default else "false").lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _load_app_from_env() -> AppSettings:
     return AppSettings(
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
         gateway_address=_env_str("GATEWAY_ADDRESS", "gateway"),
         collector_address=_env_str("COLLECTOR_ADDRESS", "collector-plc"),
         reconnect_period_ms=_env_int("RECONNECT_PERIOD_MS", 5000),
+        zmq=ZmqSettings(
+            pub_endpoint=_env_str("ZMQ_PUB_ENDPOINT", "tcp://127.0.0.1:5555"),
+            sub_endpoint=_env_str("ZMQ_SUB_ENDPOINT", "tcp://127.0.0.1:5556"),
+            pub_bind=_env_bool("ZMQ_PUB_BIND", True),
+            sub_bind=_env_bool("ZMQ_SUB_BIND", False),
+            recv_timeout_ms=_env_int("ZMQ_RECV_TIMEOUT_MS", 100),
+            linger_ms=_env_int("ZMQ_LINGER_MS", 0),
+        ),
     )
 
 

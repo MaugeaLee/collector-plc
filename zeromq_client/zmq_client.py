@@ -1,0 +1,64 @@
+"""게이트웨이 IPC용 PUB+SUB 파사드."""
+
+from __future__ import annotations
+
+import logging
+
+from model.client_model import ZmqSettings
+from model.protocol_model import ProtocolHeaderDTO
+from zeromq_client.pub_client import ZmqPubClient
+from zeromq_client.sub_client import ZmqSubClient
+
+logger = logging.getLogger(__name__)
+
+
+class ZeroMqClient:
+    """
+    collector → gateway: PUB (data / health / ack)
+    gateway → collector: SUB (cmd_r / cmd_w)
+
+    topic 기본값은 collector_address (게이트웨이 필터용).
+    """
+
+    def __init__(self, settings: ZmqSettings, *, collector_address: str):
+        self.settings = settings
+        self.collector_address = collector_address
+        self._pub = ZmqPubClient(
+            settings.pub_endpoint,
+            bind=settings.pub_bind,
+            linger_ms=settings.linger_ms,
+            topic=collector_address,
+        )
+        self._sub = ZmqSubClient(
+            settings.sub_endpoint,
+            bind=settings.sub_bind,
+            linger_ms=settings.linger_ms,
+            topic=collector_address,
+            recv_timeout_ms=settings.recv_timeout_ms,
+        )
+
+    def connect(self) -> None:
+        self._pub.connect()
+        try:
+            self._sub.connect()
+        except Exception:
+            self._pub.close()
+            raise
+        logger.info(
+            "ZeroMQ ready pub=%s(%s) sub=%s(%s) topic=%s",
+            self.settings.pub_endpoint,
+            "bind" if self.settings.pub_bind else "connect",
+            self.settings.sub_endpoint,
+            "bind" if self.settings.sub_bind else "connect",
+            self.collector_address,
+        )
+
+    def close(self) -> None:
+        self._pub.close()
+        self._sub.close()
+
+    def send(self, header: ProtocolHeaderDTO, *, topic: str | None = None) -> None:
+        self._pub.send(header, topic=topic)
+
+    def recv(self, timeout_ms: int | None = None) -> ProtocolHeaderDTO | None:
+        return self._sub.recv(timeout_ms=timeout_ms)

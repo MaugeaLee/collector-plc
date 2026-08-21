@@ -7,13 +7,26 @@ from typing import Annotated, Literal, Union
 from pydantic import BaseModel, Field, model_validator
 
 
+class ZmqSettings(BaseModel):
+    """게이트웨이 IPC용 ZeroMQ 엔드포인트."""
+
+    pub_endpoint: str = "tcp://127.0.0.1:5555"
+    sub_endpoint: str = "tcp://127.0.0.1:5556"
+    # True면 bind, False면 connect
+    pub_bind: bool = True
+    sub_bind: bool = False
+    recv_timeout_ms: int = 100
+    linger_ms: int = 0
+
+
 class AppSettings(BaseModel):
-    """프로세스 공통 (로깅, 게이트웨이, 재연결)."""
+    """프로세스 공통 (로깅, 게이트웨이, ZeroMQ, 재연결)."""
 
     log_level: str = "INFO"
     gateway_address: str = "gateway"
     collector_address: str = "collector-plc"
     reconnect_period_ms: int = 5000
+    zmq: ZmqSettings = Field(default_factory=ZmqSettings)
 
 
 class TcpSettings(BaseModel):
