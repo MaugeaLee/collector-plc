@@ -19,7 +19,7 @@ class ZeroMqClient:
     collector → gateway: PUB (data / health / ack)
     gateway → collector: SUB (cmd_r / cmd_w)
 
-    토픽: collector.plc.{devices[].id}.{msg_type}
+    토픽: collector.plc.{devices[].device_key}.{msg_type}
     """
 
     def __init__(self, settings: ZmqSettings, *, device_ids: list[str]):

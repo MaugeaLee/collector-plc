@@ -47,24 +47,24 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _load_device(device_id: str) -> dict:
+def _load_device(device_key: str) -> dict:
     data = json.loads(PLC_CONFIG.read_text(encoding="utf-8"))
     devices = data.get("devices") or []
     for d in devices:
-        if d.get("id") == device_id:
+        if d.get("device_key") == device_key:
             return dict(d)
-    raise SystemExit(f"device not found in {PLC_CONFIG}: {device_id}")
+    raise SystemExit(f"device not found in {PLC_CONFIG}: {device_key}")
 
 
-def _topic(device_id: str) -> str:
-    return f"collector.plc.{device_id}.cmd_r"
+def _topic(device_key: str) -> str:
+    return f"collector.plc.{device_key}.cmd_r"
 
 
-def _header(device_id: str, body: dict) -> dict:
+def _header(device_key: str, body: dict) -> dict:
     return {
         "msg_id": str(uuid4()),
         "gateway_address": GATEWAY_ADDRESS,
-        "collector_address": device_id,
+        "collector_address": device_key,
         "msg_type": "cmd_r",
         "msg_body": body,
         "timestamp_ms": _now_ms(),
@@ -72,7 +72,7 @@ def _header(device_id: str, body: dict) -> dict:
 
 
 def _send_and_wait_ack(
-    device_id: str,
+    device_key: str,
     body: dict,
     *,
     wait_s: float,
@@ -83,8 +83,8 @@ def _send_and_wait_ack(
     5556 bind → collector 접속 대기 → 전송.
     ACK를 받기 전까지 PUB를 닫지 않고, 같은 메시지를 주기적으로 다시 보낸다.
     """
-    topic = _topic(device_id)
-    header = _header(device_id, body)
+    topic = _topic(device_key)
+    header = _header(device_key, body)
     payload = json.dumps(header, ensure_ascii=False).encode("utf-8")
     topic_b = topic.encode("utf-8")
 
@@ -96,7 +96,7 @@ def _send_and_wait_ack(
     sub = ctx.socket(zmq.SUB)
     sub.setsockopt(zmq.LINGER, 0)
     sub.setsockopt(zmq.RCVTIMEO, 200)
-    sub.setsockopt_string(zmq.SUBSCRIBE, f"collector.plc.{device_id}.ack")
+    sub.setsockopt_string(zmq.SUBSCRIBE, f"collector.plc.{device_key}.ack")
     sub.connect(PUB_ENDPOINT)
 
     print(
@@ -154,9 +154,9 @@ def _send_and_wait_ack(
 def cmd_set_scan(args: argparse.Namespace) -> None:
     addrs = [a.strip() for a in args.addrs.split(",") if a.strip()]
     body: dict = {
-        "device_id": args.device_id,
+        "device_key": args.device_key,
         "action": "SET_SCAN",
-        "deadline_ms": _now_ms() + 10_000,
+        "timeout_ms": 10_000,
     }
     if addrs:
         body["d_address"] = addrs
@@ -165,7 +165,7 @@ def cmd_set_scan(args: argparse.Namespace) -> None:
     if "d_address" not in body and "period_ms" not in body:
         raise SystemExit("SET_SCAN: --addrs 또는 --period 필요")
     _send_and_wait_ack(
-        args.device_id,
+        args.device_key,
         body,
         wait_s=args.wait,
         join_s=args.join,
@@ -174,7 +174,7 @@ def cmd_set_scan(args: argparse.Namespace) -> None:
 
 
 def cmd_set_device(args: argparse.Namespace) -> None:
-    device = _load_device(args.device_id)
+    device = _load_device(args.device_key)
     if args.host is not None:
         device["host"] = args.host
     if args.port is not None:
@@ -189,13 +189,13 @@ def cmd_set_device(args: argparse.Namespace) -> None:
         device["timeout"] = args.timeout
 
     body = {
-        "device_id": args.device_id,
+        "device_key": args.device_key,
         "action": "SET_DEVICE",
         "device_setup": device,
-        "deadline_ms": _now_ms() + 10_000,
+        "timeout_ms": 10_000,
     }
     _send_and_wait_ack(
-        args.device_id,
+        args.device_key,
         body,
         wait_s=args.wait,
         join_s=args.join,
@@ -226,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     scan = sub.add_parser("set-scan", help="SET_SCAN (재연결 없음)")
-    scan.add_argument("device_id")
+    scan.add_argument("device_key")
     scan.add_argument(
         "--addrs",
         default="",
@@ -239,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
         "set-device",
         help="SET_DEVICE (plc_setting.json 기준 + 옵션 덮어쓰기, 재연결)",
     )
-    device.add_argument("device_id")
+    device.add_argument("device_key")
     device.add_argument("--host", default=None)
     device.add_argument("--port", type=int, default=None)
     device.add_argument("--period", type=int, default=None)

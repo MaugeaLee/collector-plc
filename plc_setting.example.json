@@ -1,7 +1,7 @@
 {
   "devices": [
     {
-      "id": "plc-tcp-1",
+      "device_key": "plc-tcp-1",
       "mode": "tcp",
       "device_id": 1,
       "timeout": 3,
@@ -12,7 +12,7 @@
       "scan_period_ms": 1000
     },
     {
-      "id": "plc-rtu-1",
+      "device_key": "plc-rtu-1",
       "mode": "rtu",
       "device_id": 1,
       "timeout": 3,
@@ -23,11 +23,15 @@
       "parity": "N",
       "stopbits": 1,
       "handle_local_echo": false,
-      "scan_addresses": ["D100"],
+      "modbus_d_register_start": 1600,
+      "modbus_d_register_type": "holding",
+      "modbus_r_register_start": 3000,
+      "modbus_r_register_type": "input",
+      "scan_addresses": ["D1600", "R3000"],
       "scan_period_ms": 1000
     },
     {
-      "id": "plc-mc-1",
+      "device_key": "plc-mc-1",
       "mode": "mc",
       "device_id": 1,
       "timeout": 3,
@@ -36,7 +40,7 @@
       "port": 5000,
       "plctype": "Q",
       "commtype": "binary",
-      "scan_addresses": ["D100", "R0", "M10"],
+      "scan_addresses": ["D100", "D100.5", "R0", "M10"],
       "scan_period_ms": 500
     }
   ]

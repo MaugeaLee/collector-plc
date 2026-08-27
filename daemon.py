@@ -17,13 +17,15 @@ from uuid import UUID, uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
+from client.addr import apply_word_bit, extract_word_bit, parse_plc_addr
 from client.base_client import BaseClient
 from client.errors import ClientError, to_client_error
 from client.mc_client import McClient
+from client.modbus_map import ModbusRegisterSpec, assert_modbus_word_device, resolve_modbus_register
 from client.rtu_client import RtuClient
 from client.tcp_client import TcpClient
 from config import save_devices, settings
-from model.client_model import DeviceSettings, Settings
+from model.client_model import DeviceSettings, ModbusMapSettings, Settings
 from model.error_model import ClientErrorCategory, ClientErrorCode
 from model.protocol_model import (
     MsgAckDTO,
@@ -113,41 +115,69 @@ def _safe_close(client: BaseClient) -> None:
         logger.debug("close failed: %s", e)
 
 
+def _modbus_map_settings(client: BaseClient) -> ModbusMapSettings:
+    """TCP/RTU 클라이언트의 Modbus D/R 매핑 설정."""
+    settings = getattr(client, "settings", None)
+    if settings is None or not isinstance(settings, ModbusMapSettings):
+        raise ClientError(
+            ClientErrorCode.UNSUPPORTED_ADDR,
+            "Modbus 매핑 설정 없음",
+        )
+    return settings
+
+
+def _read_modbus_word(client: BaseClient, spec: ModbusRegisterSpec) -> int:
+    """ModbusRegisterSpec에 따라 워드 1개를 읽는다."""
+    if spec.register_kind == "holding":
+        return int(client.read_holding_registers(spec.index, count=1)[0])
+    return int(client.read_input_registers(spec.index, count=1)[0])
+
+
+def _write_modbus_word(client: BaseClient, spec: ModbusRegisterSpec, value: int) -> None:
+    """ModbusRegisterSpec에 따라 워드 1개를 쓴다 (input 영역은 불가)."""
+    if spec.register_kind == "input":
+        raise ClientError(
+            ClientErrorCode.UNSUPPORTED_ADDR,
+            f"Input Register({spec.plc_kind}{spec.plc_num})는 쓰기 불가",
+        )
+    client.write_register(spec.index, value)
+
+
 def read_addr(client: BaseClient, addr: str) -> int:
-    """주소 문자열 한 건을 읽어 정수로 반환한다."""
+    """주소 문자열 한 건을 읽어 정수로 반환한다.
+    D100.5 / D800.A 같이 워드.비트면 해당 비트를 0/1로 반환한다.
+    """
     # MC: D/R/M/X… 문자열을 그대로 디바이스 지정
     if hasattr(client, "read_device"):
         return int(client.read_device(addr, 1)[0])
 
-    kind = addr[0].upper()
-    num = int(addr[1:])
-
-    if kind == "D":
-        return int(client.read_holding_registers(num, count=1)[0])
-
-    raise ClientError(
-        ClientErrorCode.UNSUPPORTED_ADDR,
-        f"지원하지 않는 주소: {addr}",
-    )
+    kind, num, bit = parse_plc_addr(addr)
+    map_settings = _modbus_map_settings(client)
+    spec = resolve_modbus_register(kind, num, map_settings)
+    word = _read_modbus_word(client, spec)
+    if bit is None:
+        return word
+    assert_modbus_word_device(kind, addr)
+    return extract_word_bit(word, bit)
 
 
 def write_addr(client: BaseClient, addr: str, value: int) -> None:
-    """주소 문자열 한 건에 값을 쓴다."""
+    """주소 문자열 한 건에 값을 쓴다.
+    D100.5 / D800.A 는 읽기-수정-쓰기로 해당 비트만 반영한다.
+    """
     if hasattr(client, "write_device"):
         client.write_device(addr, [int(value)])
         return
 
-    kind = addr[0].upper()
-    num = int(addr[1:])
-
-    if kind == "D":
-        client.write_register(num, value)
+    kind, num, bit = parse_plc_addr(addr)
+    map_settings = _modbus_map_settings(client)
+    spec = resolve_modbus_register(kind, num, map_settings)
+    if bit is None:
+        _write_modbus_word(client, spec, value)
         return
-
-    raise ClientError(
-        ClientErrorCode.UNSUPPORTED_ADDR,
-        f"지원하지 않는 주소: {addr}",
-    )
+    assert_modbus_word_device(kind, addr)
+    word = _read_modbus_word(client, spec)
+    _write_modbus_word(client, spec, apply_word_bit(word, bit, value))
 
 
 def _addr_soft_error_code(err: ClientError, *, write: bool) -> str:
@@ -225,7 +255,7 @@ def write_items(
 def build_write_ack(
     *,
     ref_msg_id: UUID,
-    device_id: str,
+    device_key: str,
     action: MsgCmdWEnum,
     results: list[MsgWriteItemDTO],
 ) -> MsgAckDTO:
@@ -241,7 +271,7 @@ def build_write_ack(
         reason = failed[0].error
     return MsgAckDTO(
         ref_msg_id=ref_msg_id,
-        device_id=device_id,
+        device_key=device_key,
         action=action,
         status=status,
         code=code,
@@ -269,24 +299,38 @@ def emit_health(cfg: Settings, body: MsgHealthDTO) -> None:
     )
 
 
-def emit_ack(cfg: Settings, body: MsgAckDTO) -> None:
-    """ACK 메시지를 발행한다."""
+def emit_ack(
+    cfg: Settings,
+    body: MsgAckDTO,
+    *,
+    gateway_address: str,
+) -> None:
+    """ACK 메시지를 발행한다. gateway_address는 요청 SUB 헤더 값을 에코한다."""
     _emit_protocol(
         cfg,
         msg_type=MsgTypeEnum.ACK,
         body=body.model_dump(mode="json"),
+        gateway_address=gateway_address,
     )
 
 
-def _emit_protocol(cfg: Settings, *, msg_type: MsgTypeEnum, body: dict) -> None:
+def _emit_protocol(
+    cfg: Settings,
+    *,
+    msg_type: MsgTypeEnum,
+    body: dict,
+    gateway_address: str | None = None,
+) -> None:
     """헤더를 씌워 로그하고 ZeroMQ PUB으로 보낸다."""
-    # devices[].id → collector_address / topic 세그먼트
-    collector_address = body.get("device_id")
+    # devices[].device_key → collector_address / topic 세그먼트
+    collector_address = body.get("device_key")
     if not collector_address:
-        raise ValueError(f"{msg_type.value} body에 device_id(collector_address) 없음")
+        raise ValueError(f"{msg_type.value} body에 device_key(collector_address) 없음")
+    # ACK 등 요청 응답은 SUB 헤더의 gateway_address를 주입.
+    # data/health는 요청 컨텍스트가 없어 env 기본값을 쓴다.
     header = ProtocolHeaderDTO(
         msg_id=uuid4(),
-        gateway_address=cfg.app.gateway_address,
+        gateway_address=gateway_address or cfg.app.gateway_address,
         collector_address=str(collector_address),
         msg_type=msg_type,
         msg_body=body,
@@ -310,7 +354,7 @@ def _emit_protocol(cfg: Settings, *, msg_type: MsgTypeEnum, body: dict) -> None:
 
 def _emit_device_health(
     cfg: Settings,
-    device_id: str,
+    device_key: str,
     *,
     device_ok: bool,
     reason: str | None = None,
@@ -319,7 +363,7 @@ def _emit_device_health(
     emit_health(
         cfg,
         MsgHealthDTO(
-            device_id=device_id,
+            device_key=device_key,
             ipc_ok=True,
             device_ok=device_ok,
             reason=reason,
@@ -335,7 +379,7 @@ def scan_once(
     """스캔 주소들을 한 번 읽어 MsgDataDTO를 만든다."""
     samples = read_samples(client, device.scan_addresses)
     return MsgDataDTO(
-        device_id=device.id,
+        device_key=device.device_key,
         sample_ms=now_ms(),
         samples=samples,
     )
@@ -351,19 +395,19 @@ def ensure_connected(
     while _running:
         try:
             client.connect()
-            logger.info("[%s] connected: %s", device.id, client._target())
-            _emit_device_health(cfg, device.id, device_ok=True)
+            logger.info("[%s] connected: %s", device.device_key, client._target())
+            _emit_device_health(cfg, device.device_key, device_ok=True)
             return True
         except ClientError as e:
             logger.error(
                 "[%s] connect failed: %s(%s) %s",
-                device.id,
+                device.device_key,
                 e.code.value,
                 e.code.label,
                 e.detail or e,
             )
             _emit_device_health(
-                cfg, device.id, device_ok=False, reason=e.code.value
+                cfg, device.device_key, device_ok=False, reason=e.code.value
             )
             _safe_close(client)
             _sleep_interruptible(reconnect_s)
@@ -385,7 +429,10 @@ def _persist_slots(
     """런타임 devices[]를 plc_setting.json에 저장한다."""
     devices = _snapshot_devices(slots)
     if override is not None:
-        devices = [override if d.id == override.id else d for d in devices]
+        devices = [
+            override if d.device_key == override.device_key else d
+            for d in devices
+        ]
     save_devices(devices)
 
 
@@ -401,8 +448,9 @@ def _ack_status(code: ClientErrorCode) -> MsgAckStatusEnum:
 def _emit_cmd_ack(
     cfg: Settings,
     *,
+    gateway_address: str,
     ref_msg_id: UUID,
-    device_id: str,
+    device_key: str,
     action: MsgCmdREnum | MsgCmdWEnum,
     code: ClientErrorCode = ClientErrorCode.OK,
     reason: str | None = None,
@@ -412,7 +460,7 @@ def _emit_cmd_ack(
         cfg,
         MsgAckDTO(
             ref_msg_id=ref_msg_id,
-            device_id=device_id,
+            device_key=device_key,
             action=action,
             status=status,
             code=code,
@@ -420,6 +468,7 @@ def _emit_cmd_ack(
             applied_ms=now_ms() if status is MsgAckStatusEnum.OK else None,
             results=None,
         ),
+        gateway_address=gateway_address,
     )
 
 
@@ -429,37 +478,20 @@ def _commit_device(
     slot: DeviceSlot,
     header: ProtocolHeaderDTO,
     body: MsgCmdRDTO,
-    data: dict,
+    new_device: DeviceSettings,
     *,
     reload_client: bool,
 ) -> None:
-    """설정 dict를 검증 → 저장 → 슬롯 반영 순으로 커밋하고 ACK를 낸다."""
-    try:
-        new_device = _device_adapter.validate_python(data)
-    except ValidationError as e:
-        logger.warning(
-            "[%s] %s invalid device setup: %s",
-            body.device_id,
-            body.action.value,
-            e,
-        )
+    """검증된 DeviceSettings를 저장 → 슬롯 반영 후 ACK를 낸다."""
+    if new_device.device_key != body.device_key:
         _emit_cmd_ack(
             cfg,
+            gateway_address=header.gateway_address,
             ref_msg_id=header.msg_id,
-            device_id=body.device_id,
-            action=body.action,
-            code=ClientErrorCode.INVALID_CONFIG,
-        )
-        return
-
-    if new_device.id != body.device_id:
-        _emit_cmd_ack(
-            cfg,
-            ref_msg_id=header.msg_id,
-            device_id=body.device_id,
+            device_key=body.device_key,
             action=body.action,
             code=ClientErrorCode.CMD_DEVICE_MISMATCH,
-            reason=f"device_setup.id={new_device.id}",
+            reason=f"device_setup.device_key={new_device.device_key}",
         )
         return
 
@@ -470,14 +502,15 @@ def _commit_device(
         err = _as_client_error(e)
         logger.error(
             "[%s] %s persist failed: %s",
-            body.device_id,
+            body.device_key,
             body.action.value,
             err.detail or err,
         )
         _emit_cmd_ack(
             cfg,
+            gateway_address=header.gateway_address,
             ref_msg_id=header.msg_id,
-            device_id=body.device_id,
+            device_key=body.device_key,
             action=body.action,
             code=ClientErrorCode.CONFIG_SAVE_FAILED,
             reason=err.code.value,
@@ -491,7 +524,7 @@ def _commit_device(
 
     logger.info(
         "[%s] %s applied addrs=%s period_ms=%s reload=%s",
-        body.device_id,
+        body.device_key,
         body.action.value,
         new_device.scan_addresses,
         new_device.scan_period_ms,
@@ -499,8 +532,9 @@ def _commit_device(
     )
     _emit_cmd_ack(
         cfg,
+        gateway_address=header.gateway_address,
         ref_msg_id=header.msg_id,
-        device_id=body.device_id,
+        device_key=body.device_key,
         action=body.action,
     )
 
@@ -516,8 +550,9 @@ def _apply_set_scan(
     if body.d_address is None and body.period_ms is None:
         _emit_cmd_ack(
             cfg,
+            gateway_address=header.gateway_address,
             ref_msg_id=header.msg_id,
-            device_id=body.device_id,
+            device_key=body.device_key,
             action=body.action,
             code=ClientErrorCode.CMD_FIELD_MISSING,
             reason="d_address/period_ms 없음",
@@ -531,7 +566,28 @@ def _apply_set_scan(
     if body.period_ms is not None:
         data["scan_period_ms"] = body.period_ms
 
-    _commit_device(cfg, slots, slot, header, body, data, reload_client=False)
+    try:
+        new_device = _device_adapter.validate_python(data)
+    except ValidationError as e:
+        logger.warning(
+            "[%s] %s invalid device setup: %s",
+            body.device_key,
+            body.action.value,
+            e,
+        )
+        _emit_cmd_ack(
+            cfg,
+            gateway_address=header.gateway_address,
+            ref_msg_id=header.msg_id,
+            device_key=body.device_key,
+            action=body.action,
+            code=ClientErrorCode.INVALID_CONFIG,
+        )
+        return
+
+    _commit_device(
+        cfg, slots, slot, header, body, new_device, reload_client=False
+    )
 
 
 def _apply_set_device(
@@ -542,11 +598,12 @@ def _apply_set_device(
     body: MsgCmdRDTO,
 ) -> None:
     """전체 DeviceSettings를 반영하고 close→rebuild를 요청한다."""
-    if not body.device_setup:
+    if body.device_setup is None:
         _emit_cmd_ack(
             cfg,
+            gateway_address=header.gateway_address,
             ref_msg_id=header.msg_id,
-            device_id=body.device_id,
+            device_key=body.device_key,
             action=body.action,
             code=ClientErrorCode.CMD_FIELD_MISSING,
             reason="device_setup 없음",
@@ -559,7 +616,7 @@ def _apply_set_device(
         slot,
         header,
         body,
-        dict(body.device_setup),
+        body.device_setup,
         reload_client=True,
     )
 
@@ -574,8 +631,9 @@ def _emit_body_invalid_ack(cfg: Settings, header: ProtocolHeaderDTO) -> None:
         return
     _emit_cmd_ack(
         cfg,
+        gateway_address=header.gateway_address,
         ref_msg_id=header.msg_id,
-        device_id=header.collector_address,
+        device_key=header.collector_address,
         action=action,
         code=ClientErrorCode.CMD_BODY_INVALID,
     )
@@ -594,28 +652,30 @@ def _handle_cmd_r(
         _emit_body_invalid_ack(cfg, header)
         return
 
-    if body.device_id != header.collector_address:
+    if body.device_key != header.collector_address:
         logger.warning(
-            "cmd_r device_id 불일치: topic=%s body=%s",
+            "cmd_r device_key 불일치: topic=%s body=%s",
             header.collector_address,
-            body.device_id,
+            body.device_key,
         )
         _emit_cmd_ack(
             cfg,
+            gateway_address=header.gateway_address,
             ref_msg_id=header.msg_id,
-            device_id=header.collector_address,
+            device_key=header.collector_address,
             action=body.action,
             code=ClientErrorCode.CMD_DEVICE_MISMATCH,
-            reason=f"body.device_id={body.device_id}",
+            reason=f"body.device_key={body.device_key}",
         )
         return
 
-    slot = slots.get(body.device_id)
+    slot = slots.get(body.device_key)
     if slot is None:
         _emit_cmd_ack(
             cfg,
+            gateway_address=header.gateway_address,
             ref_msg_id=header.msg_id,
-            device_id=body.device_id,
+            device_key=body.device_key,
             action=body.action,
             code=ClientErrorCode.CMD_UNKNOWN_DEVICE,
         )
@@ -630,13 +690,14 @@ def _handle_cmd_r(
 
     logger.info(
         "[%s] cmd_r action not implemented: %s",
-        body.device_id,
+        body.device_key,
         body.action.value,
     )
     _emit_cmd_ack(
         cfg,
+        gateway_address=header.gateway_address,
         ref_msg_id=header.msg_id,
-        device_id=body.device_id,
+        device_key=body.device_key,
         action=body.action,
         code=ClientErrorCode.CMD_UNSUPPORTED_ACTION,
     )
@@ -676,7 +737,7 @@ def run_device(cfg: Settings, slot: DeviceSlot) -> None:
 
     logger.info(
         "[%s] worker start mode=%s target=%s addrs=%s period_ms=%s",
-        device.id,
+        device.device_key,
         device.mode,
         client._target(),
         device.scan_addresses,
@@ -694,7 +755,7 @@ def run_device(cfg: Settings, slot: DeviceSlot) -> None:
 
             while _running:
                 if slot.reload.is_set():
-                    logger.info("[%s] reloading client settings", device.id)
+                    logger.info("[%s] reloading client settings", device.device_key)
                     _safe_close(client)
                     with slot.lock:
                         device = slot.device.model_copy(deep=True)
@@ -715,7 +776,7 @@ def run_device(cfg: Settings, slot: DeviceSlot) -> None:
                     err = _as_client_error(e)
                     logger.warning(
                         "[%s] scan failed: %s(%s) %s",
-                        device.id,
+                        device.device_key,
                         err.code.value,
                         err.code.label,
                         err.detail or err,
@@ -723,20 +784,20 @@ def run_device(cfg: Settings, slot: DeviceSlot) -> None:
                     if err.code.requires_reconnect:
                         _emit_device_health(
                             cfg,
-                            device.id,
+                            device.device_key,
                             device_ok=False,
                             reason=err.code.value,
                         )
                         logger.warning(
                             "[%s] reconnecting due to %s",
-                            device.id,
+                            device.device_key,
                             err.code.label,
                         )
                         _safe_close(client)
                         break
                     logger.error(
                         "[%s] unexpected scan error (no reconnect): %s",
-                        device.id,
+                        device.device_key,
                         err.detail or err,
                     )
 
@@ -746,7 +807,7 @@ def run_device(cfg: Settings, slot: DeviceSlot) -> None:
                     _sleep_interruptible(remain, wake=slot.reload)
     finally:
         _safe_close(client)
-        logger.info("[%s] worker stop", device.id)
+        logger.info("[%s] worker stop", device.device_key)
 
 
 def run(cfg: Settings | None = None) -> None:
@@ -756,7 +817,7 @@ def run(cfg: Settings | None = None) -> None:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    slots = {d.id: DeviceSlot(device=d) for d in cfg.devices}
+    slots = {d.device_key: DeviceSlot(device=d) for d in cfg.devices}
 
     logger.info(
         "daemon start devices=%s reconnect_ms=%s",

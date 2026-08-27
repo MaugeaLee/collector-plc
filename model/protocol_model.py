@@ -1,8 +1,14 @@
-from uuid import UUID
-from pydantic import BaseModel
-from typing import List, Optional, Union
-from enum import StrEnum
+"""게이트웨이↔collector 프로토콜 Enum·DTO."""
 
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import List, Optional, Union
+from uuid import UUID
+
+from pydantic import BaseModel
+
+from model.client_model import DeviceSettings
 from model.error_model import ClientErrorCode
 
 
@@ -34,6 +40,7 @@ class MsgAckStatusEnum(StrEnum):
 
 class ProtocolHeaderDTO(BaseModel):
     msg_id: UUID
+    # 상위(게이트웨이)가 채운 값. ACK 응답 시 그대로 에코한다.
     gateway_address: str
     collector_address: str
     msg_type: MsgTypeEnum
@@ -42,13 +49,14 @@ class ProtocolHeaderDTO(BaseModel):
 
 
 class MsgCmdRDTO(BaseModel):
-    device_id: str
+    device_key: str
     action: MsgCmdREnum
     d_address: Optional[List[str]] = None
     period_ms: Optional[int] = None
-    # SET_DEVICE: DeviceSettings와 동일 스키마 (id는 device_id와 일치)
-    device_setup: Optional[dict] = None
-    deadline_ms: int
+    # SET_DEVICE: DeviceSettings와 동일 (device_key는 body.device_key와 일치)
+    device_setup: Optional[DeviceSettings] = None
+    # 수신 시각 기준 허용 소요 시간(ms). collector가 deadline = now + timeout_ms 로 계산
+    timeout_ms: int
 
 
 class MsgWriteItemDTO(BaseModel):
@@ -58,15 +66,16 @@ class MsgWriteItemDTO(BaseModel):
 
 
 class MsgCmdWDTO(BaseModel):
-    device_id: str
+    device_key: str
     action: MsgCmdWEnum
     command: List[MsgWriteItemDTO]
-    deadline_ms: int
+    # 수신 시각 기준 허용 소요 시간(ms). collector가 deadline = now + timeout_ms 로 계산
+    timeout_ms: int
 
 
 class MsgAckDTO(BaseModel):
     ref_msg_id: UUID
-    device_id: str
+    device_key: str
     action: Union[MsgCmdREnum, MsgCmdWEnum]
     status: MsgAckStatusEnum
     # 정상은 E-0000, 그 외는 실패 사유 코드
@@ -77,7 +86,7 @@ class MsgAckDTO(BaseModel):
 
 
 class MsgHealthDTO(BaseModel):
-    device_id: str
+    device_key: str
     ipc_ok: bool
     device_ok: bool
     reason: Optional[str] = None
@@ -91,6 +100,6 @@ class MsgSampleDTO(BaseModel):
 
 
 class MsgDataDTO(BaseModel):
-    device_id: str
+    device_key: str
     sample_ms: int
     samples: List[MsgSampleDTO]

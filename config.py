@@ -4,7 +4,7 @@
 사용 예:
     from config import settings
     for device in settings.devices:
-        print(device.id, device.mode)
+        print(device.device_key, device.mode)
 """
 
 from __future__ import annotations
@@ -78,8 +78,8 @@ def _load_app_from_env() -> AppSettings:
         gateway_address=_env_str("GATEWAY_ADDRESS", "gateway"),
         reconnect_period_ms=_env_int("RECONNECT_PERIOD_MS", 5000),
         zmq=ZmqSettings(
-            pub_endpoint=_env_str("ZMQ_PUB_ENDPOINT", "tcp://127.0.0.1:5555"),
-            sub_endpoint=_env_str("ZMQ_SUB_ENDPOINT", "tcp://127.0.0.1:5556"),
+            pub_endpoint=_env_str("ZMQ_PUB_ENDPOINT", "tcp://127.0.0.1:5556"),
+            sub_endpoint=_env_str("ZMQ_SUB_ENDPOINT", "tcp://127.0.0.1:5555"),
             pub_bind=_env_bool("ZMQ_PUB_BIND", True),
             sub_bind=_env_bool("ZMQ_SUB_BIND", False),
             recv_timeout_ms=_env_int("ZMQ_RECV_TIMEOUT_MS", 100),

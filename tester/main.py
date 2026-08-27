@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
 
 PUB_ENDPOINT = os.getenv("ZMQ_PUB_ENDPOINT", "tcp://127.0.0.1:5555").strip()
-# devices[].id 별 토픽 → collector.plc.* 전부 수신
+# devices[].device_key 별 토픽 → collector.plc.* 전부 수신
 TOPIC_PREFIX = "collector.plc."
 
 

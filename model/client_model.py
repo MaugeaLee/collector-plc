@@ -10,8 +10,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class ZmqSettings(BaseModel):
     """게이트웨이 IPC용 ZeroMQ 엔드포인트."""
 
-    pub_endpoint: str = "tcp://127.0.0.1:5555"
-    sub_endpoint: str = "tcp://127.0.0.1:5556"
+    pub_endpoint: str = "tcp://127.0.0.1:5556"
+    sub_endpoint: str = "tcp://127.0.0.1:5555"
     # True면 bind, False면 connect
     pub_bind: bool = True
     sub_bind: bool = False
@@ -28,17 +28,32 @@ class AppSettings(BaseModel):
     zmq: ZmqSettings = Field(default_factory=ZmqSettings)
 
 
-def _validate_device_logical_id(v: str) -> str:
-    # 토픽 collector.plc.{id}.{msg_type} 계층용
+def _validate_device_key(v: str) -> str:
+    # 토픽 collector.plc.{device_key}.{msg_type} 계층용
     if not v or "." in v:
         raise ValueError(
-            "devices[].id에 '.'를 넣을 수 없습니다 "
+            "devices[].device_key에 '.'를 넣을 수 없습니다 "
             f"(예: plc-mitsubishi-1): {v!r}"
         )
     return v
 
 
-class TcpSettings(BaseModel):
+class ModbusMapSettings(BaseModel):
+    """LS XG 등 Modbus 서버: PLC 내부 번지 ↔ Modbus offset 매핑.
+
+    XG5000 Modbus Settings의 Word Write/Read 시작 주소와 일치시킨다.
+    D와 R은 서로 다른 register_start·register_type으로 분리해 혼선을 막는다.
+    """
+
+    # D{n} where n == modbus_d_register_start → Modbus index 0 (40001)
+    modbus_d_register_start: int = 0
+    modbus_d_register_type: Literal["holding", "input"] = "holding"
+    # R{n} where n == modbus_r_register_start → Modbus index 0
+    modbus_r_register_start: int | None = None
+    modbus_r_register_type: Literal["holding", "input"] = "input"
+
+
+class TcpSettings(ModbusMapSettings):
     mode: Literal["tcp"] = "tcp"
     device_id: int = 1
     timeout: float = 3.0
@@ -47,7 +62,7 @@ class TcpSettings(BaseModel):
     port: int = 502
 
 
-class RtuSettings(BaseModel):
+class RtuSettings(ModbusMapSettings):
     mode: Literal["rtu"] = "rtu"
     device_id: int = 1
     timeout: float = 3.0
@@ -80,36 +95,36 @@ PlcSettings = Annotated[
 class TcpDevice(TcpSettings):
     """연결 + 스캔 설정을 포함한 디바이스."""
 
-    id: str
+    device_key: str
     scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
     scan_period_ms: int = 1000
 
-    @field_validator("id")
+    @field_validator("device_key")
     @classmethod
-    def _id_no_dot(cls, v: str) -> str:
-        return _validate_device_logical_id(v)
+    def _key_no_dot(cls, v: str) -> str:
+        return _validate_device_key(v)
 
 
 class RtuDevice(RtuSettings):
-    id: str
+    device_key: str
     scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
     scan_period_ms: int = 1000
 
-    @field_validator("id")
+    @field_validator("device_key")
     @classmethod
-    def _id_no_dot(cls, v: str) -> str:
-        return _validate_device_logical_id(v)
+    def _key_no_dot(cls, v: str) -> str:
+        return _validate_device_key(v)
 
 
 class McDevice(McSettings):
-    id: str
+    device_key: str
     scan_addresses: list[str] = Field(default_factory=lambda: ["D100"])
     scan_period_ms: int = 1000
 
-    @field_validator("id")
+    @field_validator("device_key")
     @classmethod
-    def _id_no_dot(cls, v: str) -> str:
-        return _validate_device_logical_id(v)
+    def _key_no_dot(cls, v: str) -> str:
+        return _validate_device_key(v)
 
 
 DeviceSettings = Annotated[
@@ -124,11 +139,11 @@ class DevicesFile(BaseModel):
     devices: list[DeviceSettings] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _unique_ids(self) -> DevicesFile:
-        ids = [d.id for d in self.devices]
-        dup = {i for i in ids if ids.count(i) > 1}
+    def _unique_keys(self) -> DevicesFile:
+        keys = [d.device_key for d in self.devices]
+        dup = {k for k in keys if keys.count(k) > 1}
         if dup:
-            raise ValueError(f"device id 중복: {sorted(dup)}")
+            raise ValueError(f"device_key 중복: {sorted(dup)}")
         return self
 
 
