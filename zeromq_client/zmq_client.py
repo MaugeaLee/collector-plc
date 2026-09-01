@@ -25,7 +25,10 @@ class ZeroMqClient:
     def __init__(self, settings: ZmqSettings, *, device_ids: list[str]):
         self.settings = settings
         self.device_ids = list(device_ids)
-        self._lock = threading.Lock()
+        # PUB(워커 스레드)와 SUB(메인 스레드)는 소켓이 다르다.
+        # 한 lock으로 recv까지 감싸면 SUB 대기 동안 DATA PUB이 전부 멈춘다.
+        self._pub_lock = threading.Lock()
+        self._sub_lock = threading.Lock()
         self._pub = ZmqPubClient(
             settings.pub_endpoint,
             bind=settings.pub_bind,
@@ -56,17 +59,18 @@ class ZeroMqClient:
         )
 
     def close(self) -> None:
-        with self._lock:
+        with self._pub_lock:
             self._pub.close()
+        with self._sub_lock:
             self._sub.close()
 
     def send(self, header: ProtocolHeaderDTO, *, topic: str | None = None) -> None:
         t = topic if topic is not None else topic_for(
             header.collector_address, header.msg_type
         )
-        with self._lock:
+        with self._pub_lock:
             self._pub.send(header, topic=t)
 
     def recv(self, timeout_ms: int | None = None) -> ProtocolHeaderDTO | None:
-        with self._lock:
+        with self._sub_lock:
             return self._sub.recv(timeout_ms=timeout_ms)
