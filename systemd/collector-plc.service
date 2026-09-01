@@ -1,0 +1,27 @@
+[Unit]
+Description=Edge PLC Collector (ZeroMQ gateway publisher)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=collector
+Group=collector
+
+WorkingDirectory=/opt/collector-plc
+EnvironmentFile=/etc/collector-plc/.env
+ExecStart=/opt/collector-plc/.venv/bin/python main.py
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# RTU(mode: rtu) 시리얼 포트 접근
+SupplementaryGroups=dialout
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=collector-plc
+
+[Install]
+WantedBy=multi-user.target
