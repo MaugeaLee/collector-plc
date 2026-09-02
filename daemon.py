@@ -13,6 +13,7 @@ import signal
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Literal
 from uuid import UUID, uuid4
 
 from pydantic import TypeAdapter, ValidationError
@@ -390,14 +391,24 @@ def ensure_connected(
     device: DeviceSettings,
     client: BaseClient,
     reconnect_s: float,
-) -> bool:
-    """연결될 때까지 재시도하고, 종료 신호면 False를 반환한다."""
+    *,
+    wake: threading.Event | None = None,
+) -> Literal["ok", "stop", "reload"]:
+    """연결될 때까지 재시도한다.
+
+    Returns:
+        ok: 연결 성공
+        stop: 프로세스 종료 신호
+        reload: SET_DEVICE 등으로 wake가 set됨 → 호출측에서 client 재생성
+    """
     while _running:
+        if wake is not None and wake.is_set():
+            return "reload"
         try:
             client.connect()
             logger.info("[%s] connected: %s", device.device_key, client._target())
             _emit_device_health(cfg, device.device_key, device_ok=True)
-            return True
+            return "ok"
         except ClientError as e:
             logger.error(
                 "[%s] connect failed: %s(%s) %s",
@@ -410,8 +421,11 @@ def ensure_connected(
                 cfg, device.device_key, device_ok=False, reason=e.code.value
             )
             _safe_close(client)
-            _sleep_interruptible(reconnect_s)
-    return False
+            # reconnect sleep 중 SET_DEVICE가 오면 즉시 빠져나가 client를 다시 만든다
+            _sleep_interruptible(reconnect_s, wake=wake)
+            if wake is not None and wake.is_set():
+                return "reload"
+    return "stop"
 
 
 def _snapshot_devices(slots: dict[str, DeviceSlot]) -> list[DeviceSettings]:
@@ -728,6 +742,20 @@ def _dispatch_sub(
     logger.debug("sub ignore msg_type=%s", header.msg_type.value)
 
 
+def _rebuild_client(slot: DeviceSlot, client: BaseClient) -> tuple[DeviceSettings, BaseClient]:
+    """SET_DEVICE 반영: 기존 연결을 닫고 slot.device로 클라이언트를 다시 만든다."""
+    with slot.lock:
+        device = slot.device.model_copy(deep=True)
+        slot.reload.clear()
+    logger.info(
+        "[%s] reloading client settings target=%s",
+        device.device_key,
+        getattr(device, "port", None) or getattr(device, "host", None),
+    )
+    _safe_close(client)
+    return device, build_client(device)
+
+
 def run_device(cfg: Settings, slot: DeviceSlot) -> None:
     """단일 디바이스의 연결·스캔·재연결·설정 리로드 루프를 돌린다."""
     reconnect_s = cfg.app.reconnect_period_ms / 1000.0
@@ -746,21 +774,28 @@ def run_device(cfg: Settings, slot: DeviceSlot) -> None:
 
     try:
         while _running:
+            # 연결 실패 재시도 중에도 SET_DEVICE가 오면 여기서 client를 교체한다.
+            # (예전에는 ensure_connected가 무한 재시도하며 reload를 무시해
+            #  파일만 ttyUSB0으로 바뀌고 런타임은 COM3에 남는 버그가 있었다.)
+            if slot.reload.is_set():
+                device, client = _rebuild_client(slot, client)
+                continue
+
             with slot.lock:
                 device = slot.device.model_copy(deep=True)
-                slot.reload.clear()
 
-            if not ensure_connected(cfg, device, client, reconnect_s):
+            status = ensure_connected(
+                cfg, device, client, reconnect_s, wake=slot.reload
+            )
+            if status == "stop":
                 break
+            if status == "reload":
+                device, client = _rebuild_client(slot, client)
+                continue
 
             while _running:
                 if slot.reload.is_set():
-                    logger.info("[%s] reloading client settings", device.device_key)
-                    _safe_close(client)
-                    with slot.lock:
-                        device = slot.device.model_copy(deep=True)
-                        slot.reload.clear()
-                    client = build_client(device)
+                    device, client = _rebuild_client(slot, client)
                     break
 
                 with slot.lock:
